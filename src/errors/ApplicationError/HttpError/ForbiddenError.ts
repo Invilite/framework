@@ -1,0 +1,9 @@
+import HttpError from "./index";
+import {HttpStatusCodes} from "../../../types/enums/HttpStatusCodes";
+
+export class ForbiddenError extends HttpError {
+    public constructor(message: string, response?: string | Buffer) {
+        super(message, HttpStatusCodes.FORBIDDEN, response);
+        this.name = 'ForbiddenError';
+    }
+}

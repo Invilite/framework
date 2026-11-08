@@ -1,0 +1,1 @@
+export type WithId<T, R = any> = T & { _id: R };
