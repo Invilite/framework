@@ -113,9 +113,9 @@ export class SessionService {
      * Kills every session of the user. Order matters: the durable revocation first, then the in-memory
      * blacklist broadcast - a refresh between the two would otherwise mint a token the blacklist never sees.
      */
-    public async endAll(userId: number): Promise<void> {
+    public async endAll(userId: number): Promise<boolean> {
         await this.store.revokeAllForUser(userId);
-        await this.blacklist?.revokeAllForUser(userId);
+        return this.blacklist ? this.blacklist.revokeAllForUser(userId) : true;
     }
 
     public clearCookies(response: Response): void {

@@ -1,8 +1,14 @@
-import TokenBlacklistService, {ACCESS_TOKEN_MAX_TTL_SECONDS, TokenRevocationTransport} from "../../src/services/TokenBlacklistService";
+import TokenBlacklistService, {
+    ACCESS_TOKEN_MAX_TTL_SECONDS,
+    TokenRevocation,
+    TokenRevocationSource,
+    TokenRevocationTransport,
+} from "../../src/services/TokenBlacklistService";
 
 class FakeLogger {
     public error(): void {}
     public notice(): void {}
+    public info(): void {}
     public debug(): void {}
     public warning(): void {}
 }
@@ -15,8 +21,14 @@ class RecordingTransport implements TokenRevocationTransport {
         this.published.push({userIds, revokedAt});
     }
 
+    public reconnectHandler: (() => void | Promise<void>) | null = null;
+
     public async subscribeToRevocations(handler: (userIds: number[], revokedAt: Date) => void | Promise<void>): Promise<void> {
         this.handler = handler;
+    }
+
+    public subscribeToReconnects(handler: () => void | Promise<void>): void {
+        this.reconnectHandler = handler;
     }
 }
 
@@ -72,7 +84,7 @@ describe("TokenBlacklistService - semantyka iat (hard requirement)", () => {
         };
         const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport);
 
-        await expect(service.revokeAllForUser(7, NOW)).resolves.toBeUndefined();
+        await expect(service.revokeAllForUser(7, NOW)).resolves.toBe(false);
         expect(service.isRevoked(7, Math.floor(NOW.getTime() / 1000))).toBe(true);
     });
 
@@ -114,5 +126,138 @@ describe("TokenBlacklistService - semantyka iat (hard requirement)", () => {
         await transport.handler!([99], NOW);
 
         expect(service.isRevoked(99, Math.floor(NOW.getTime() / 1000))).toBe(true);
+    });
+});
+class StaticSource implements TokenRevocationSource {
+    public calls: number = 0;
+
+    public constructor(public revocations: TokenRevocation[], public failure: Error | null = null) {
+    }
+
+    public async listRevocations(): Promise<TokenRevocation[]> {
+        this.calls++;
+        if (this.failure) {
+            throw this.failure;
+        }
+        return this.revocations;
+    }
+}
+
+function epochSeconds(date: Date): number {
+    return Math.floor(date.getTime() / 1000);
+}
+
+describe("TokenBlacklistService - revocation source", () => {
+    it("start() loads the source before subscribing: tokens issued up to revokedAt are rejected, later ones pass", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const source: StaticSource = new StaticSource([{userId: 7, revokedAt: NOW}]);
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport, source);
+
+        await service.start();
+
+        expect(source.calls).toBe(1);
+        expect(service.isRevoked(7, epochSeconds(NOW))).toBe(true);
+        expect(service.isRevoked(7, epochSeconds(NOW) + 1)).toBe(false);
+        expect(service.isRevoked(8, epochSeconds(NOW))).toBe(false);
+        expect(transport.handler).not.toBeNull();
+    });
+
+    it("start() subscribes before loading the source, so a revocation broadcast during the load is not lost", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const subscribedAtLoad: boolean[] = [];
+        const source: TokenRevocationSource = {
+            listRevocations: async (): Promise<TokenRevocation[]> => {
+                subscribedAtLoad.push(transport.handler !== null && transport.reconnectHandler !== null);
+                await transport.handler!([11], NOW);
+                return [];
+            },
+        };
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport, source);
+
+        await service.start();
+
+        expect(subscribedAtLoad).toEqual([true]);
+        expect(service.isRevoked(11, epochSeconds(NOW))).toBe(true);
+    });
+
+    it("start() rejects when the source fails", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const source: StaticSource = new StaticSource([], new Error('database down'));
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport, source);
+
+        await expect(service.start()).rejects.toThrow('database down');
+    });
+
+    it("start() works with a source and no transport", async () => {
+        const source: StaticSource = new StaticSource([{userId: 7, revokedAt: NOW}]);
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, null, source);
+
+        await service.start();
+
+        expect(service.isRevoked(7, epochSeconds(NOW))).toBe(true);
+    });
+
+    it("a transport reconnect reloads the source", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const source: StaticSource = new StaticSource([]);
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport, source);
+        await service.start();
+        source.revocations = [{userId: 9, revokedAt: NOW}];
+
+        await transport.reconnectHandler!();
+
+        expect(source.calls).toBe(2);
+        expect(service.isRevoked(9, epochSeconds(NOW))).toBe(true);
+    });
+
+    it("a source failure after a reconnect is logged and keeps the existing entries", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const logger: FakeLogger = new FakeLogger();
+        const errorSpy: jest.SpyInstance = jest.spyOn(logger, 'error');
+        const source: StaticSource = new StaticSource([{userId: 7, revokedAt: NOW}]);
+        const service: TokenBlacklistService = new TokenBlacklistService(logger as any, transport, source);
+        await service.start();
+        source.failure = new Error('database down');
+
+        await expect(Promise.resolve(transport.reconnectHandler!())).resolves.toBeUndefined();
+
+        expect(errorSpy).toHaveBeenCalled();
+        expect(service.isRevoked(7, epochSeconds(NOW))).toBe(true);
+    });
+
+    it("a loaded revocation expires after the access token TTL", async () => {
+        const revokedAt: Date = new Date(Date.now() - (ACCESS_TOKEN_MAX_TTL_SECONDS + 5) * 1000);
+        const source: StaticSource = new StaticSource([{userId: 7, revokedAt}]);
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, null, source);
+
+        await service.start();
+
+        expect(service.isRevoked(7, epochSeconds(revokedAt))).toBe(false);
+    });
+
+    it("without a source start() only subscribes, as before", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport);
+
+        await service.start();
+
+        expect(transport.handler).not.toBeNull();
+        expect(transport.reconnectHandler).not.toBeNull();
+    });
+});
+
+describe("TokenBlacklistService - broadcast confirmation", () => {
+    it("revokeAllForUser resolves true without a transport", async () => {
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, null);
+
+        await expect(service.revokeAllForUser(7, NOW)).resolves.toBe(true);
+    });
+
+    it("revokeAllForUser resolves true after a confirmed publish", async () => {
+        const transport: RecordingTransport = new RecordingTransport();
+        const service: TokenBlacklistService = new TokenBlacklistService(new FakeLogger() as any, transport);
+
+        await expect(service.revokeAllForUser(7, NOW)).resolves.toBe(true);
+        expect(transport.published).toHaveLength(1);
     });
 });

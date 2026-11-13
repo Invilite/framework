@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). During 0.x a new feature or a breaking change bumps the minor version, a fix bumps the patch.
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- `TokenRevocationSource` and `TokenRevocation` in `services/TokenBlacklistService`: an optional third constructor argument of `TokenBlacklistService`. On `start()` the service subscribes to the transport first and then loads the source (a revocation broadcast during the load is not lost), and it reloads the source after every transport reconnect, so revocations survive an instance restart and missed NATS messages; a failing source makes `start()` reject.
+- `REVOCATION_CONFIRM_TIMEOUT_MS` in `services/NatsTokenRevocationTransport`.
+
+### Changed
+
+- **Breaking:** `TokenRevocationTransport` requires `subscribeToReconnects(handler)`; `NatsTokenRevocationTransport` implements it with the connection status stream.
+- `NatsTokenRevocationTransport.publishRevocation` waits for the server confirmation (`flush`) up to `REVOCATION_CONFIRM_TIMEOUT_MS` and rejects otherwise.
+- **Breaking:** `TokenBlacklistService.revokeAllForUser` and `SessionService.endAll` resolve `true` when the revocation was broadcast (or there is no transport) and `false` when the broadcast failed; the local revocation stands either way. An application interface that declares `endAll(userId): Promise<void>` and receives a `SessionService` no longer type-checks: declare `Promise<boolean>` (or `Promise<unknown>`).
+
 ## [0.1.0] - 2026-11-08
 
 ### Added

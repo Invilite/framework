@@ -226,4 +226,17 @@ describe('SessionService', () => {
         expect(order).toEqual(['store', 'blacklist']);
         expect(blacklist.revokeAllForUser).toHaveBeenCalledWith(7);
     });
+
+    it('endAll returns the blacklist broadcast result', async (): Promise<void> => {
+        const blacklist: any = {revokeAllForUser: jest.fn(async (): Promise<boolean> => false)};
+        const session: SessionService = createSession(identityOf(ALICE), blacklist);
+
+        await expect(session.endAll(7)).resolves.toBe(false);
+    });
+
+    it('endAll returns true without a blacklist', async (): Promise<void> => {
+        const session: SessionService = createSession(identityOf(ALICE));
+
+        await expect(session.endAll(7)).resolves.toBe(true);
+    });
 });

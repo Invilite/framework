@@ -11,6 +11,16 @@ import {Logger} from "@invilite/logger";
 export interface TokenRevocationTransport {
     publishRevocation(userIds: number[], revokedAt: Date): Promise<void>;
     subscribeToRevocations(handler: (userIds: number[], revokedAt: Date) => void | Promise<void>): Promise<void>;
+    subscribeToReconnects(handler: () => void | Promise<void>): void;
+}
+
+export interface TokenRevocation {
+    userId: number;
+    revokedAt: Date;
+}
+
+export interface TokenRevocationSource {
+    listRevocations(): Promise<TokenRevocation[]>;
 }
 
 /** Access tokens are issued with a 1h TTL (SessionConfig.accessTtlSeconds) - an entry can be pruned after that. */
@@ -29,11 +39,11 @@ export const ACCESS_TOKEN_MAX_TTL_SECONDS: number = 60 * 60;
  * Units trap: JWT `iat` is in SECONDS. Compare against
  * Math.floor(revokedAt.getTime() / 1000), never against milliseconds.
  *
- * Accepted residual risk (owner decision): an instance restart within the TTL
- * window can resurrect revoked access tokens for up to 1h (the map is
- * in-memory and NATS delivery is at-most-once). Durable backstops: refresh
- * tokens are revoked in the database and the login/get-token gates re-check
- * the user state (blocked / pending-deletion tags, is_active).
+ * The map is in-memory and NATS delivery is at-most-once, so the optional
+ * TokenRevocationSource (the application's durable record of revocations)
+ * refills it on start() and after every transport reconnect. Without a source
+ * an instance restart within the TTL window resurrects revoked access tokens
+ * for up to 1h.
  */
 export default class TokenBlacklistService {
     /** userId -> revocation epoch seconds. */
@@ -43,11 +53,17 @@ export default class TokenBlacklistService {
     public constructor(
         private readonly logger: Logger,
         private readonly transport: TokenRevocationTransport | null = null,
+        private readonly source: TokenRevocationSource | null = null,
     ) {
     }
 
     public async start(): Promise<void> {
-        if (!this.transport || this.subscriptionActive) {
+        if (this.subscriptionActive) {
+            return;
+        }
+
+        if (!this.transport) {
+            await this.loadSource();
             return;
         }
 
@@ -57,6 +73,14 @@ export default class TokenBlacklistService {
             }
             this.logger.debug(`[TokenBlacklist] received revocation for ${userIds.length} user(s) from transport`);
         });
+        this.transport.subscribeToReconnects(async (): Promise<void> => {
+            try {
+                await this.loadSource();
+            } catch (e: unknown) {
+                this.logger.error(`[TokenBlacklist] reloading revocations after a reconnect failed: ${(e as {message?: string} | null)?.message || e}`);
+            }
+        });
+        await this.loadSource();
         this.subscriptionActive = true;
         this.logger.notice('[TokenBlacklist] started (transport connected)');
     }
@@ -71,18 +95,22 @@ export default class TokenBlacklistService {
      * The local map is updated synchronously FIRST (this instance is protected
      * immediately, no round-trip through the transport), then the revocation is
      * broadcast. Idempotent - repeated calls only move the timestamp forward.
+     * Resolves false when the broadcast was not confirmed - the caller decides
+     * whether to report it; the local revocation stands either way.
      */
-    public async revokeAllForUser(userId: number, revokedAt: Date = new Date()): Promise<void> {
+    public async revokeAllForUser(userId: number, revokedAt: Date = new Date()): Promise<boolean> {
         this.rememberRevocation(userId, revokedAt);
 
-        if (this.transport) {
-            try {
-                await this.transport.publishRevocation([userId], revokedAt);
-            } catch (e: unknown) {
-                // Local revocation already applied; a failed broadcast only delays
-                // propagation to other instances - never fail the caller's flow.
-                this.logger.error(`[TokenBlacklist] failed to publish revocation for user ${userId}: ${(e as {message?: string} | null)?.message || e}`);
-            }
+        if (!this.transport) {
+            return true;
+        }
+
+        try {
+            await this.transport.publishRevocation([userId], revokedAt);
+            return true;
+        } catch (e: unknown) {
+            this.logger.error(`[TokenBlacklist] failed to publish revocation for user ${userId}: ${(e as {message?: string} | null)?.message || e}`);
+            return false;
         }
     }
 
@@ -103,6 +131,18 @@ export default class TokenBlacklistService {
         }
 
         return tokenIatSeconds <= revokedAtEpoch;
+    }
+
+    private async loadSource(): Promise<void> {
+        if (!this.source) {
+            return;
+        }
+
+        const revocations: TokenRevocation[] = await this.source.listRevocations();
+        for (const revocation of revocations) {
+            this.rememberRevocation(revocation.userId, revocation.revokedAt);
+        }
+        this.logger.info(`[TokenBlacklist] loaded ${revocations.length} revocation(s) from the source`);
     }
 
     private rememberRevocation(userId: number, revokedAt: Date): void {
