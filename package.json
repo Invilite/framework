@@ -1,6 +1,6 @@
 {
   "name": "@invilite/framework",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A TypeScript framework for Express servers with decorators, PostgreSQL repositories, sessions, background tasks and storage adapters.",
   "license": "GPL-3.0",
   "author": "Marek Ulwański <marek@ulwanski.pl>",

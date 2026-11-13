@@ -61,7 +61,7 @@ function createRequest(refreshToken?: string): any {
     return {
         headers: {'user-agent': 'jest'},
         signedCookies: refreshToken ? {refreshToken} : {},
-        clientAddress: '127.0.0.1',
+        ip: '127.0.0.1',
     };
 }
 
@@ -197,7 +197,7 @@ describe('SessionService', () => {
 
         it('unknown client address -> throws before storing (inet NOT NULL)', async (): Promise<void> => {
             const session: SessionService = createSession(identityOf(ALICE));
-            const request: any = {...createRequest(), clientAddress: undefined, ip: undefined};
+            const request: any = {...createRequest(), ip: undefined};
 
             await expect(session.start(request, createResponse(), 7)).rejects.toThrow(/client address/);
             expect(store.inserted).toHaveLength(0);

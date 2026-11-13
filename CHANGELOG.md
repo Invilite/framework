@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). During 0.x a new feature or a breaking change bumps the minor version, a fix bumps the patch.
 
+## [0.2.1] - Unreleased
+
+### Fixed
+
+- `request.ip` is the client address resolved by `clientAddressOf` (`CF-Connecting-IP` when `trustCloudflare`, otherwise the `trust proxy` chain, never a non-address): `CoreMiddleware` overwrites Express's getter once per request. Behind a CDN Express alone gave the edge address there.
+
+### Removed
+
+- `ExtendedRequest.clientAddress`: read `request.ip`, the single client address. `SessionService` and `LoggerMiddleware` read `request.ip`. The `clientAddress` field of the request events is unchanged and carries the same value.
+
 ## [0.2.0] - Unreleased
 
 ### Added

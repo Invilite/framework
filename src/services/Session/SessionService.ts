@@ -3,7 +3,6 @@ import {Jwt, JwtPayload} from "jsonwebtoken";
 import {AuthService} from "../AuthService";
 import TokenBlacklistService from "../TokenBlacklistService";
 import {AbstractLogger} from "../../types/interfaces/AbstractLogger";
-import {ExtendedRequest} from "../../models/ExtendedRequest";
 import {SessionCookies} from "./SessionCookies";
 import {RefreshTokenRecord, RefreshTokenStore, SessionConfig, SessionIdentity, SessionIdentityProvider} from "./SessionTypes";
 
@@ -37,7 +36,7 @@ export class SessionService {
             return null;
         }
 
-        const ipAddress: string | undefined = (request as ExtendedRequest).clientAddress ?? request.ip;
+        const ipAddress: string | undefined = request.ip;
         if (!ipAddress) {
             // refresh_tokens.ip_address is inet NOT NULL - an empty string would fail the INSERT with a cryptic error.
             throw new Error('Cannot start a session: the client address is unknown.');

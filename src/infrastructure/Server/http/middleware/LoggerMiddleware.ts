@@ -19,7 +19,7 @@ export function LoggerMiddleware(logger: Logger) {
         })
 
         if (request.path !== '/api/status/health') {
-            extendedRequest.logger.info(`${requestMethod} ${path} (${extendedRequest.clientAddress})${redactedReferrer ? ` [Referrer: ${redactedReferrer}]` : ''}`);
+            extendedRequest.logger.info(`${requestMethod} ${path} (${request.ip})${redactedReferrer ? ` [Referrer: ${redactedReferrer}]` : ''}`);
         }
 
         response.once('finish', () => {

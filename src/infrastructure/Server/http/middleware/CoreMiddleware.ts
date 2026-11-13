@@ -102,9 +102,10 @@ export function CoreMiddleware(eventBus: EventBus, trustCloudflare: boolean = fa
             eventBus.emit('http.request.completed', responseEventPayload);
         });
 
+        Object.defineProperty(request, 'ip', {value: clientAddress, enumerable: true, configurable: true});
+
         const extendedRequest: ExtendedRequest = request as ExtendedRequest;
         extendedRequest.requestId = requestId;
-        extendedRequest.clientAddress = clientAddress;
 
         response.locals.requestId   = requestId;
         response.locals.currentUrl  = url.href;

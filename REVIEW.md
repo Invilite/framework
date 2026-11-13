@@ -38,6 +38,10 @@ Register of non-obvious behaviors in this framework: things that caused (or coul
    *Tell:* `new URL(request.originalUrl, origin)` used directly; `request.hostname` in URL building.
    *Check:* `test/unit/CoreMiddlewareRequestUrl.test.ts`. `src/infrastructure/Server/http/middleware/CoreMiddleware.ts` (`requestUrlOf`).
 
+9. **`request.ip` is the only client address, and `CoreMiddleware` writes it.** Behind a CDN, Express's own `request.ip` follows `X-Forwarded-For` from the proxy next to the server and gives the CDN edge address, so a second accessor next to it made code pick the wrong one silently: whatever read `request.ip` logged and stored the edge address while other code had the client. Now `clientAddressOf` (CDN header when `trustCloudflare`, otherwise the `trust proxy` chain, never a non-address) runs once per request and `CoreMiddleware` overwrites `request.ip` with the result; the request event carries the same value as `clientAddress`.
+   *Tell:* a new property or helper for the client address on the request; `CF-Connecting-IP`, `X-Forwarded-For` or `socket.remoteAddress` read outside `clientAddressOf`; middleware registered before `CoreMiddleware` that reads `request.ip`.
+   *Check:* application and framework code read `request.ip` and nothing else; a change of the address rules goes into `clientAddressOf` only. `test/unit/CoreMiddlewareClientAddress.test.ts`. `src/infrastructure/Server/http/middleware/CoreMiddleware.ts`.
+
 ---
 
 ## Responses and sentinels
