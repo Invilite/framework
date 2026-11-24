@@ -4,7 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). During 0.x a new feature or a breaking change bumps the minor version, a fix bumps the patch.
 
-## [0.2.1] - Unreleased
+## [0.2.2] - 2026-11-24
+
+### Added
+
+- `StreamingStorage` and `StorageStream` in `types/interfaces/Storage`, and `S3Storage.getWithInfo` returning the response size and `Content-Range`, with 416 as an empty stream.
+
+### Changed
+
+- `StorageStream` is defined in `types/interfaces/Storage`; `SeaweedStorage` re-exports it.
+
+## [0.2.1] - 2026-11-13
 
 ### Fixed
 
@@ -14,7 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `ExtendedRequest.clientAddress`: read `request.ip`, the single client address. `SessionService` and `LoggerMiddleware` read `request.ip`. The `clientAddress` field of the request events is unchanged and carries the same value.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-13
 
 ### Added
 

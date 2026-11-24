@@ -2,14 +2,8 @@ import {Readable} from "stream";
 import AbstractStorage from "./AbstractStorage";
 import SeaweedService from "../../services/SeaweedService";
 import StorageError from "../../errors/ApplicationError/StorageError";
-import {PutOptions, ReadRange, StorageStat} from "../../types/interfaces/Storage";
-
-/** Stream plus the response headers needed by a Range-aware HTTP boundary. */
-export interface StorageStream {
-    stream: Readable;
-    size: number;
-    contentRange: string | null;
-}
+import {PutOptions, ReadRange, StorageStat, StorageStream, StreamingStorage} from "../../types/interfaces/Storage";
+export type {StorageStream} from "../../types/interfaces/Storage";
 
 /**
  * Storage adapter over the SeaweedFS filer. Keys use the Storage contract shape (relative path,
@@ -19,7 +13,7 @@ export interface StorageStream {
  * Seaweed collection. `readHost` is the optional public read host; when it is null the adapter has
  * no public URLs and readUrl() reports StorageError('UNSUPPORTED').
  */
-export default class SeaweedStorage extends AbstractStorage {
+export default class SeaweedStorage extends AbstractStorage implements StreamingStorage {
     private static readonly INVALID_KEY_CHARACTERS: RegExp = /[\s\u0000-\u001F\u007F?#%\\"]/;
 
     public constructor(

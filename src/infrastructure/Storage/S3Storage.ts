@@ -2,7 +2,7 @@ import {randomBytes} from "crypto";
 import {Readable} from "stream";
 import StorageError from "../../errors/ApplicationError/StorageError";
 import AbstractStorage from "./AbstractStorage";
-import {PutOptions, ReadRange, StorageStat} from "../../types/interfaces/Storage";
+import {PutOptions, ReadRange, StorageStat, StorageStream, StreamingStorage} from "../../types/interfaces/Storage";
 import S3Client, {FetchLike, S3CompletedPart, S3Error} from "./S3Client";
 
 export interface S3StorageConfig {
@@ -26,7 +26,7 @@ const KEY_CHARACTERS: RegExp = /^[a-z0-9._/-]+$/;
  * the eight operations in S3Client, so switching providers is configuration. Keys are limited to characters every
  * provider signs and encodes the same way.
  */
-export default class S3Storage extends AbstractStorage {
+export default class S3Storage extends AbstractStorage implements StreamingStorage {
     private readonly publicUrl: string | null;
     private readonly client: S3Client;
 
@@ -57,9 +57,13 @@ export default class S3Storage extends AbstractStorage {
     }
 
     public async get(key: string, range?: ReadRange): Promise<Readable> {
+        return (await this.getWithInfo(key, range)).stream;
+    }
+
+    public async getWithInfo(key: string, range?: ReadRange): Promise<StorageStream> {
         S3Storage.assertValidKey(key);
         if (range && range.length <= 0) {
-            return Readable.from([]);
+            return {stream: Readable.from([]), size: 0, contentRange: null};
         }
 
         try {
@@ -69,10 +73,14 @@ export default class S3Storage extends AbstractStorage {
                     await response.body.cancel();
                 }
 
-                return Readable.from([]);
+                return {stream: Readable.from([]), size: 0, contentRange: null};
             }
 
-            return Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream);
+            return {
+                stream: Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream),
+                size: Number(response.headers.get('content-length') ?? 0),
+                contentRange: response.headers.get('content-range'),
+            };
         } catch (error) {
             if (error instanceof S3Error && error.status === 404) {
                 throw new StorageError(`Storage object "${key}" not found`, 'NOT_FOUND');

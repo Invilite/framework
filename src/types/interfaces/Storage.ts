@@ -31,6 +31,12 @@ export interface StorageStat {
     lastModified?: Date;
 }
 
+export interface StorageStream {
+    stream: Readable;
+    size: number;
+    contentRange: string | null;
+}
+
 /**
  * Pluggable file storage contract. Backends (local filesystem, SeaweedFS filer,
  * S3) implement this interface; the composition root registers the chosen
@@ -59,4 +65,8 @@ export default interface Storage {
     delete(key: string): Promise<void>;
     stat(key: string): Promise<StorageStat | null>;
     readUrl(key: string): Promise<string>;
+}
+
+export interface StreamingStorage extends Storage {
+    getWithInfo(key: string, range?: ReadRange): Promise<StorageStream>;
 }

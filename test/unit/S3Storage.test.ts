@@ -3,6 +3,7 @@ import {Readable} from "stream";
 import StorageError from "../../src/errors/ApplicationError/StorageError";
 import S3Storage, {PART_SIZE, S3StorageConfig} from "../../src/infrastructure/Storage/S3Storage";
 import {FetchLike} from "../../src/infrastructure/Storage/S3Client";
+import {StorageStream} from "../../src/types/interfaces/Storage";
 
 interface RecordedRequest {
     method: string;
@@ -460,6 +461,102 @@ describe("S3Storage reads", () => {
         const storage: S3Storage = new S3Storage({...CONFIG, publicUrl: null}, recorder.fetch);
 
         await expect(storage.readUrl('documents/ab/cd/abcd/file')).rejects.toMatchObject({code: 'UNSUPPORTED'});
+        expect(recorder.calls).toHaveLength(0);
+    });
+});
+
+describe("getWithInfo", () => {
+    it("returns size and content range of a range response", async () => {
+        const recorder: Recorder = record((): Response => new Response(Buffer.from('cdef'), {
+            status: 206,
+            headers: {
+                'Content-Length': '4',
+                'Content-Range': 'bytes 2-5/10',
+            },
+        }));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        const result: StorageStream = await storage.getWithInfo('articles/hello.bin', {offset: 2, length: 4});
+
+        expect(result.size).toBe(4);
+        expect(result.contentRange).toBe('bytes 2-5/10');
+        expect((await readAll(result.stream)).toString()).toBe('cdef');
+        expect(recorder.calls[0].headers.get('range')).toBe('bytes=2-5');
+    });
+
+    it("returns full size and null content range without range", async () => {
+        const recorder: Recorder = record((): Response => new Response(Buffer.from('abcdefghij'), {
+            status: 200,
+            headers: {'Content-Length': '10'},
+        }));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        const result: StorageStream = await storage.getWithInfo('articles/hello.bin');
+
+        expect(result.size).toBe(10);
+        expect(result.contentRange).toBeNull();
+        expect((await readAll(result.stream)).toString()).toBe('abcdefghij');
+        expect(recorder.calls[0].headers.get('range')).toBeNull();
+    });
+
+    it("returns the tail of the object for a range to the end", async () => {
+        const recorder: Recorder = record((): Response => new Response(Buffer.from('ghij'), {
+            status: 206,
+            headers: {
+                'Content-Length': '4',
+                'Content-Range': 'bytes 6-9/10',
+            },
+        }));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        const result: StorageStream = await storage.getWithInfo('articles/hello.bin', {offset: 6, length: 4});
+
+        expect(result.size).toBe(4);
+        expect(result.contentRange).toBe('bytes 6-9/10');
+        expect((await readAll(result.stream)).toString()).toBe('ghij');
+        expect(recorder.calls[0].headers.get('range')).toBe('bytes=6-9');
+    });
+
+    it("returns an empty stream for 416", async () => {
+        const recorder: Recorder = record((): Response => new Response('', {status: 416}));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        const result: StorageStream = await storage.getWithInfo('articles/hello.bin', {offset: 100, length: 10});
+
+        expect(result.size).toBe(0);
+        expect(result.contentRange).toBeNull();
+        expect((await readAll(result.stream)).length).toBe(0);
+    });
+
+    it("throws NOT_FOUND for a missing object", async () => {
+        const recorder: Recorder = record((): Response => new Response(
+            '<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>',
+            {status: 404},
+        ));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        await expect(storage.getWithInfo('articles/missing.jpg')).rejects.toMatchObject({code: 'NOT_FOUND'});
+    });
+
+    it("throws READ_FAILED for a server error", async () => {
+        const recorder: Recorder = record((): Response => new Response(
+            '<Error><Code>InternalError</Code><Message>broken</Message></Error>',
+            {status: 500},
+        ));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        await expect(storage.getWithInfo('articles/hello.bin')).rejects.toMatchObject({code: 'READ_FAILED'});
+    });
+
+    it("does not call S3 for a non-positive range length", async () => {
+        const recorder: Recorder = record((): Response => new Response('', {status: 500}));
+        const storage: S3Storage = new S3Storage(CONFIG, recorder.fetch);
+
+        const result: StorageStream = await storage.getWithInfo('articles/hello.bin', {offset: 0, length: 0});
+
+        expect(result.size).toBe(0);
+        expect(result.contentRange).toBeNull();
+        expect((await readAll(result.stream)).length).toBe(0);
         expect(recorder.calls).toHaveLength(0);
     });
 });

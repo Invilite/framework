@@ -1,7 +1,8 @@
 import {Readable} from "stream";
-import SeaweedStorage from "../../src/infrastructure/Storage/SeaweedStorage";
+import SeaweedStorage, {StorageStream as AdapterStorageStream} from "../../src/infrastructure/Storage/SeaweedStorage";
 import SeaweedService from "../../src/services/SeaweedService";
 import StorageError from "../../src/errors/ApplicationError/StorageError";
+import {StorageStream} from "../../src/types/interfaces/Storage";
 
 interface FakeSeaweed {
     upload: jest.Mock;
@@ -70,6 +71,18 @@ describe('SeaweedStorage', () => {
 
         await expect(build(seaweed).getWithInfo(KEY, {offset: 5, length: 10}))
             .resolves.toEqual({stream, size: 10, contentRange: 'bytes 5-14/100'});
+    });
+
+    it('eksportuje StorageStream zgodny z types/interfaces/Storage', (): void => {
+        const adapterStream: AdapterStorageStream = {
+            stream: Readable.from([]),
+            size: 0,
+            contentRange: null,
+        };
+        const interfaceStream: StorageStream = adapterStream;
+        const backToAdapter: AdapterStorageStream = interfaceStream;
+
+        expect(backToAdapter).toBe(adapterStream);
     });
 
     it('brak pliku → StorageError NOT_FOUND', async (): Promise<void> => {
