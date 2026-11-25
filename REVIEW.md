@@ -302,9 +302,9 @@ Register of non-obvious behaviors in this framework: things that caused (or coul
    *Tell:* a new `server.on('upgrade', ...)`; `new URL(..., request.headers.host)`; an `await` in the upgrade path before the socket has an `error` handler; `emit('connection', ...)` replacing the listener loop.
    *Check:* `test/unit/SocketServerUpgrade.test.ts` ("SocketServer upgrade robustness") stays green. `src/infrastructure/Server/SocketServer.ts`.
 
-13. **`presenceChanged` runs on one instance per change.** The instance that decided it calls the hook once for the whole cluster, so state or sockets touched there reach only that instance's clients.
-    *Tell:* a `presenceChanged` that writes to a local map, `context.state` or local sockets instead of publishing; a publish from the `enter`/`exit` path of the presence.
-    *Check:* the hook publishes through `SocketPublisher` or writes shared storage; consumers treat `joined` of a present account and `left` of an absent one as no-ops and read `members()` for the truth. `src/services/Socket/SocketPresence.ts`.
+13. **`presenceChanged` runs on one instance per change.** The instance that decided it calls the hook once for the whole cluster, so state or sockets touched there reach only that instance's clients. Who decides: a join or a grace-end `left` the instance where it happened; the `left` of a departed instance the lowest candidate still live, where the candidates are fixed at the departure (the survivor itself and the instances it first heard no later than the departed instance's last message, so an instance that started later never decides); after a partition longer than `expireMs` heals, every observer calls `joined` for the returning instance's accounts it sees nowhere else.
+    *Tell:* a `presenceChanged` implementation that writes to local state (a map on the controller, a cache in the process) or sends to sockets of this instance instead of publishing through `SocketPublisher` or writing shared storage; a publish from the `enter`/`exit` path of the presence; a decider rule that reads the current `remotes` at release time instead of the candidates stored with the holding set.
+    *Check:* the hook publishes through `SocketPublisher` or writes shared storage; consumers treat `joined` of a present account and `left` of an absent one as no-ops and read `members()` for the truth; `test/unit/SocketPresence.test.ts` (lower id starting during a hold, partition heal) stays green. `src/services/Socket/SocketPresence.ts` (`depart`, `releaseHeld`, `updateRemote`).
 
 ---
 

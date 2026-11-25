@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `SocketPresence` (`services/Socket/SocketPresence`): which accounts are in a channel across instances, over the socket broker on `<prefix>.presence`; `members(channel)`, `enter`, `exit`, a grace period for reloads and reconnects, heartbeats, hand-off of a silent instance's channels to the lowest live instance. Options `graceMs`, `heartbeatMs`, `expireMs`, `syncWaitMs`.
+- `SocketPresence` (`services/Socket/SocketPresence`): which accounts are in a channel across instances, over the socket broker on `<prefix>.presence`. Methods `SocketPresence.register(type, handler)`, `start(log)`, `stop()`, `enter(channel, userId)`, `exit(channel, userId)` and `members(channel)` (resolves with `[]` after `stop()`, rejects for a channel it cannot track); a grace period for reloads and reconnects, heartbeats, hand-off of a departed instance's accounts to the lowest candidate that knew it, `joined` again after a partition longer than `expireMs` heals. Options `graceMs`, `heartbeatMs`, `expireMs`, `syncWaitMs` and `instanceId` (unique per process, a random UUID by default).
 - `presence` option of `@SocketChannel(type, {presence: true})`: the hub tracks the accounts of channels of this type (guests are skipped).
 - `AbstractSocketController.presenceChanged?(channel, change)` and `SocketPresenceChange` (`types/interfaces/SocketPresenceChange`): called once per cluster with the accounts that joined or left.
 - `WebServerSocketOptions.presence`: required when a channel sets `presence: true`; a missing one, or one presence channel type on two endpoints, stops the start.

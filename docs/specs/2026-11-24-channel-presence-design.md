@@ -114,3 +114,14 @@ around join, refused join, unsubscribe and disconnect; start fails without `opti
 `docs/socket-channels.md` gains a "Presence" section (API, timing, the races above); `REVIEW.md` an entry for
 "`presenceChanged` runs on one instance only - never publish from `enter`/`exit` paths". Release 0.3.0 (new
 feature = minor), `CHANGELOG.md` entry, tag `v0.3.0`; the maintainer publishes.
+
+**Note 2026-11-26: implementation differs.** The current state is in `docs/socket-channels.md` section 4. The grace-end
+`left` (rule 2) also checks the holding sets, not only remote entries. The reply to `sync` carries `alive` too. A
+stale channel entry (rule 5) is dropped only for an instance that sent `alive` within 1.5 x `heartbeatMs`; otherwise it
+waits for the instance expiry. The holding-set release (rule 4) is decided from a candidate snapshot instead of the
+lowest live instance at release time: the survivor itself and the live instances it first heard no later than the
+departed instance's last message (`bye` included); the lowest candidate still live decides, and an instance started
+later is never a candidate. An instance expired by silence and heard again within 10 x `expireMs` makes every observer
+call `joined` for its accounts present nowhere else in the observer's view (partition heal), so rule 3 no longer holds
+for that rebuild window. `members()` resolves with `[]` after `stop()` and gives a rejected promise for a channel it
+cannot track; `enter`/`exit` throw synchronously, also on an account id that is not a positive safe integer.

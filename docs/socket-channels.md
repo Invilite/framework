@@ -92,8 +92,11 @@ export class RoomSocketController extends AbstractSocketController<AppConnection
         return context.connection.userId !== null;
     }
 
-    public presenceChanged(channel: string, change: SocketPresenceChange): void {
-        this.serviceContainer.get<SocketPublisher>('SocketPublisher').publish(channel, 'presence.changed', change);
+    public async presenceChanged(channel: string, change: SocketPresenceChange): Promise<void> {
+        this.serviceContainer.get<SocketPublisher>('SocketPublisher').publish(channel, 'presence.changed', {
+            joined: await this.publicKeys(change.joined),
+            left: await this.publicKeys(change.left),
+        });
     }
 }
 
@@ -110,8 +113,9 @@ const accounts: number[] = await presence.members('room:42');
 
 - `@SocketChannel(type, {presence: true})`: after every successful `join` the hub counts the account in the channel, and `leave` uncounts it. Guests (`userId === null`) are never tracked. Several tabs or connections of one account count as one member.
 - `SocketPresence` takes the broker and the subject prefix from the publisher, like the hubs; create it next to the publisher and register it as `'SocketPresence'`. `WebServer` starts and stops it with the sockets.
-- `members(channel)` resolves with the account ids present on any instance, ascending, including accounts in a grace period. Until the first sync window after the start is over it waits, so it never answers from an empty view.
-- `presenceChanged(channel, change)` (optional, on the channel controller) gets `SocketPresenceChange = {joined: number[]; left: number[]}`. An exception, or a rejected promise, is logged.
+- `members(channel)` resolves with the account ids present on any instance, ascending, including accounts in a grace period. Until the first sync window after the start is over it waits, so it never answers from an empty view. After `stop()` it resolves with `[]` at once (a call still waiting for the sync window too). A channel it cannot track (invalid, personal, or of a type without presence) gives a rejected promise, not a synchronous throw.
+- `enter(channel, userId)` and `exit(channel, userId)` (called by the hub) throw synchronously on such a channel, and on an account id that is not a positive safe integer.
+- `presenceChanged(channel, change)` (optional, on the channel controller) gets `SocketPresenceChange = {joined: number[]; left: number[]}`. An exception, or a rejected promise, is logged. The account ids are for the server: `publicKeys` in the example stands for the application's own mapping to what it may show about an account; publishing only a count is the other safe choice.
 - `joined` is called when an account enters a channel it was in nowhere in the cluster; `left` when it is gone everywhere, after the grace period. A second tab, a second instance, a page reload and a reconnect to another instance within `graceMs` call nothing.
 - A start error: a `presence: true` channel without `options.socket.presence`, or one presence channel type on two endpoints.
 
@@ -126,21 +130,26 @@ Instances talk over the existing broker, on one subject `<prefix>.presence`, wit
 | `expireMs` | 30000 | an instance silent for this long is gone; also the lifetime of a channel entry |
 | `syncWaitMs` | 1000 | after the start the instance only listens; its joins are decided after this window |
 
-`now` and `instanceId` can be set too (tests). Timers do not keep the process alive.
+`instanceId` can be set too (tests); it must be unique per process, and the default is a random UUID. Timers do not keep the process alive.
 
 How the cases resolve:
 
-- An instance that stops (`bye`) or goes silent (`expireMs`) has its accounts held for `graceMs` (none after an expiry, which is already late). Then the live instance with the lowest id calls `left` for the held accounts present nowhere else; the others only drop them. An account is also kept if it is in a holding set of another stopped instance, so a rolling restart does not blink.
-- The reply to `sync` carries `alive` too, so all instances agree on the lowest live instance.
-- A channel entry of an instance that stays alive but stops reporting it (a lost `left`) is dropped without a call, but only while that instance sent `alive` within `heartbeatMs`; otherwise it waits for the instance expiry, which hands every channel to the lowest live instance.
-- After the broker reports the subscription `failed`, or refuses `subscribe`, the presence subscribes and syncs again on the next heartbeat. Publish and subscribe errors are logged.
+- An instance that stops (`bye`) or goes silent (`expireMs`) has its accounts held for `graceMs` (none after an expiry, which is already late). Then one instance calls `left` for the held accounts present nowhere else; the others only drop them. An account is also kept if it is in a holding set of another stopped instance, so a rolling restart does not blink.
+- Who decides a hold: when an instance departs, every survivor fixes the candidates, itself and the live instances it first heard no later than the departed instance's last message (`bye` included). When the hold ends, the lowest candidate that is still live decides. An instance that appeared later is never a candidate: it has not seen the departed instance's accounts, so it could not decide their `left`.
+- The reply to `sync` carries `alive` too, so all instances agree on who is live.
+- A channel entry of an instance that stays alive but stops reporting it (a lost `left`) is dropped without a call, but only while that instance sent `alive` within 1.5 x `heartbeatMs`; otherwise it waits for the instance expiry, which hands every channel over as above.
+- A partition longer than `expireMs` gives a `left` on both sides for the accounts of the other. An instance that was expired by silence (not `bye`) and is heard again within 10 x `expireMs` is rebuilt for 1.5 x `heartbeatMs`: for every account it reports that is present nowhere else in its own view (local, other instances, holding sets), each observer calls `joined`. Every observer does it, not only one, because the `left` was decided while the sides could not hear each other.
+- After the broker reports the subscription `failed` (also for a subscription that stays open, for example when delivery threw), or refuses `subscribe`, the presence unsubscribes, then subscribes and syncs again on the next heartbeat. Publish and subscribe errors are logged.
+- A message with another protocol version is ignored, with one `warning` per sender instance.
 
 Accepted races. Consumers treat `joined` of an account already present, and `left` of an absent one, as no-ops; `members()` is the truth.
 
 - Two instances deciding the join of one account at the same moment: two `joined`.
 - A reconnect message arriving just after a grace check: `left`, then `joined`.
-- A fresh instance does not see the holding sets of the others, so a client of a just stopped instance that reconnects to a brand-new instance can produce a duplicate `joined`.
+- A fresh instance does not see the holding sets of the others, so a client of a just stopped instance that reconnects to a brand-new instance can produce a duplicate `joined`. The `left` of the stopped instance's accounts stays with the survivors (the candidate rule above).
 - Another instance's grace ending inside a fresh instance's sync window can produce `left` and then `joined`.
+- The last subscriptions of one account on two instances ending within broker latency: each grace ends while the other instance's entry is still there, so the `left` can be lost. It does not heal by itself; `members()` is right once the `left` messages arrive.
+- A healed partition (above): a duplicate `joined` from every observer, and from the returning instance's own joins decided during the rebuild window.
 
 ## 5. The personal channel
 
