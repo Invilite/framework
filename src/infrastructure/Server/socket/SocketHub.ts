@@ -2,6 +2,7 @@ import {AbstractLogger} from "../../../types/interfaces/AbstractLogger";
 import {SocketBroker, SocketBrokerSubscription} from "../../../types/interfaces/SocketBroker";
 import {SocketConnection} from "../../../types/interfaces/SocketConnection";
 import {SocketContext} from "../../../types/interfaces/SocketContext";
+import {SocketPresence} from "../../../services/Socket/SocketPresence";
 import {SocketRefusalError} from "../../../errors/ApplicationError/SocketRefusalError";
 import {ValidationError} from "../../../errors/ValidationError";
 import {SocketBusEvent, SocketChannelName, SocketClientFrame, SocketProtocol} from "./SocketProtocol";
@@ -31,6 +32,7 @@ export interface SocketMessageHandler {
 
 export interface SocketChannelHandlers {
     lossy: boolean;
+    presence: boolean;
     join(context: SocketContext): boolean | Promise<boolean>;
     leave(context: SocketContext): void | Promise<void>;
     messages: ReadonlyMap<string, SocketMessageHandler>;
@@ -49,6 +51,7 @@ export interface SocketHubOptions {
     log: AbstractLogger;
     limits?: Partial<SocketLimits>;
     now?: () => number;
+    presence?: Pick<SocketPresence, 'enter' | 'exit'>;
     /** The endpoint's `disconnect`, called once per connection after `leave` of all its channels. */
     disconnect?: (connection: SocketConnection) => void | Promise<void>;
 }
@@ -119,6 +122,7 @@ export class SocketHub {
     private readonly subjectPrefix: string;
     private readonly log: AbstractLogger;
     private readonly now: () => number;
+    private readonly presence: Pick<SocketPresence, 'enter' | 'exit'> | null;
     private readonly disconnect: ((connection: SocketConnection) => void | Promise<void>) | null;
     private readonly types: Map<string, SocketChannelHandlers> = new Map<string, SocketChannelHandlers>();
     private readonly members: Set<Member> = new Set<Member>();
@@ -132,6 +136,7 @@ export class SocketHub {
         this.log = options.log;
         this.limits = {...SocketHub.DEFAULT_LIMITS, ...options.limits};
         this.now = options.now ?? Date.now;
+        this.presence = options.presence ?? null;
         this.disconnect = options.disconnect ?? null;
     }
 
@@ -460,6 +465,9 @@ export class SocketHub {
         }
         channel.members.add(member);
         member.subscriptions.set(subscription.name, subscription);
+        if (this.tracks(member, subscription)) {
+            this.presence?.enter(subscription.name, member.connection.userId as number);
+        }
 
         return true;
     }
@@ -470,6 +478,9 @@ export class SocketHub {
             return Promise.resolve();
         }
         member.subscriptions.delete(name);
+        if (this.tracks(member, subscription)) {
+            this.presence?.exit(name, member.connection.userId as number);
+        }
 
         const channel: Channel | undefined = this.channels.get(subscription.subject);
         if (channel !== undefined) {
@@ -488,6 +499,10 @@ export class SocketHub {
 
         // After the message in progress, so `leave` never runs alongside a method of the same subscription.
         return subscription.queue.then((): Promise<void> => this.runLeave(handlers, context));
+    }
+
+    private tracks(member: Member, subscription: Subscription): boolean {
+        return this.presence !== null && subscription.handlers?.presence === true && member.connection.userId !== null;
     }
 
     private async runLeave(handlers: SocketChannelHandlers, context: SocketContext): Promise<void> {

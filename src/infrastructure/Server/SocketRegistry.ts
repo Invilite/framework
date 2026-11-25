@@ -198,6 +198,7 @@ export class SocketRegistry {
         try {
             endpoint.hub.register(channel.type, {
                 lossy: channel.lossy,
+                presence: channel.presence,
                 join: (context: SocketContext): boolean | Promise<boolean> => instance.join(context),
                 leave: (context: SocketContext): void | Promise<void> => instance.leave?.(context),
                 messages,

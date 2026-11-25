@@ -50,9 +50,11 @@ describe("socket hub", () => {
     let events: string[];
     let received: unknown[];
     let disconnected: string[];
+    let presenceCalls: string[];
 
     const orders: SocketChannelHandlers = {
         lossy: true,
+        presence: false,
         join: (context: SocketContext): boolean => {
             events.push(`join ${context.channel} ${context.connection.id}`);
             if (context.key === '99') {
@@ -108,6 +110,7 @@ describe("socket hub", () => {
         events = [];
         received = [];
         disconnected = [];
+        presenceCalls = [];
         log = new Logger();
         broker = new MemorySocketBroker();
         publisher = new SocketPublisher(broker);
@@ -116,6 +119,14 @@ describe("socket hub", () => {
             subjectPrefix: 'ws',
             log,
             now: (): number => now,
+            presence: {
+                enter: (channel: string, userId: number): void => {
+                    presenceCalls.push(`enter ${channel} ${userId}`);
+                },
+                exit: (channel: string, userId: number): void => {
+                    presenceCalls.push(`exit ${channel} ${userId}`);
+                },
+            },
             disconnect: (connection: SocketConnection): void => {
                 disconnected.push(connection.id);
                 events.push(`disconnect ${connection.id}`);
@@ -272,6 +283,7 @@ describe("socket hub", () => {
         let release: () => void = (): void => undefined;
         hub.register('room', {
             lossy: false,
+            presence: false,
             join: (): boolean => true,
             leave: (): void => undefined,
             messages: new Map<string, SocketMessageHandler>([
@@ -310,6 +322,7 @@ describe("socket hub", () => {
         let release: () => void = (): void => undefined;
         hub.register('room', {
             lossy: false,
+            presence: false,
             join: (): boolean => true,
             leave: (context: SocketContext): void => {
                 events.push(`leave ${context.channel}`);
@@ -515,6 +528,78 @@ describe("socket hub", () => {
         expect(() => hub.register('Order', orders)).toThrow(/Invalid/);
     });
 
+    function registerRoom(presence: boolean, join: () => boolean | Promise<boolean>): void {
+        hub.register('room', {
+            lossy: false,
+            presence,
+            join,
+            leave: (): void => undefined,
+            messages: new Map<string, SocketMessageHandler>(),
+        });
+    }
+
+    it("enters and exits presence channels for accounts", async () => {
+        registerRoom(true, (): boolean => true);
+        const client: Client = connect(7);
+        client.hub.receive('{"op":"sub","ch":"room:1"}');
+        client.hub.receive('{"op":"sub","ch":"room:2"}');
+        await flush();
+        expect(presenceCalls).toEqual(['enter room:1 7', 'enter room:2 7']);
+
+        client.hub.receive('{"op":"unsub","ch":"room:1"}');
+        await flush();
+        expect(presenceCalls).toEqual(['enter room:1 7', 'enter room:2 7', 'exit room:1 7']);
+
+        client.hub.closed();
+        await flush();
+        expect(presenceCalls).toEqual(['enter room:1 7', 'enter room:2 7', 'exit room:1 7', 'exit room:2 7']);
+    });
+
+    it("never tracks guests, refused joins or channels without presence", async () => {
+        registerRoom(true, (): boolean => true);
+        hub.register('lobby', {
+            lossy: false,
+            presence: true,
+            join: (): boolean => false,
+            leave: (): void => undefined,
+            messages: new Map<string, SocketMessageHandler>(),
+        });
+        hub.register('plain', {
+            lossy: false,
+            presence: false,
+            join: (): boolean => true,
+            leave: (): void => undefined,
+            messages: new Map<string, SocketMessageHandler>(),
+        });
+        const guest: Client = connect(null);
+        guest.hub.receive('{"op":"sub","ch":"room:1"}');
+        const account: Client = connect(7);
+        account.hub.receive('{"op":"sub","ch":"lobby:1"}');
+        account.hub.receive('{"op":"sub","ch":"plain:1"}');
+        account.hub.receive('{"op":"sub","ch":"user"}');
+        await flush();
+        guest.hub.closed();
+        account.hub.closed();
+        await flush();
+
+        expect(presenceCalls).toEqual([]);
+    });
+
+    it("exits a subscription whose join finished after the disconnect", async () => {
+        let release: (allowed: boolean) => void = (): void => undefined;
+        registerRoom(true, (): Promise<boolean> => new Promise<boolean>((resolve: (allowed: boolean) => void): void => {
+            release = resolve;
+        }));
+        const client: Client = connect(7);
+        client.hub.receive('{"op":"sub","ch":"room:1"}');
+        await flush();
+        client.hub.closed();
+        release(true);
+        await flush();
+
+        expect(presenceCalls).toEqual([]);
+    });
+
     it("answers failed and calls leave when the broker refuses the subscription", async () => {
         const client: Client = connect(1);
         const subscribe: jest.SpyInstance = jest.spyOn(broker, 'subscribe').mockImplementation((): never => {
@@ -538,6 +623,7 @@ describe("socket hub", () => {
         let release: (allowed: boolean) => void = (): void => undefined;
         hub.register('room', {
             lossy: false,
+            presence: false,
             join: (): Promise<boolean> => new Promise<boolean>((resolve: (allowed: boolean) => void): void => {
                 release = resolve;
             }),
@@ -563,6 +649,7 @@ describe("socket hub", () => {
         let release: () => void = (): void => undefined;
         hub.register('room', {
             lossy: false,
+            presence: false,
             join: (): boolean => true,
             leave: (context: SocketContext): void => {
                 events.push(`leave ${context.channel}`);
