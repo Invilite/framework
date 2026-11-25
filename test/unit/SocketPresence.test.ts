@@ -7,7 +7,9 @@ import {AbstractLogger} from "../../src/types/interfaces/AbstractLogger";
 
 class FilteredBroker implements SocketBroker {
     public filter: (payload: string) => boolean = (): boolean => true;
+    public receiving: boolean = true;
     public subscribeFailure: Error | null = null;
+    public lastFailed: ((error: Error) => void) | null = null;
 
     public constructor(private readonly shared: MemorySocketBroker) {
     }
@@ -22,8 +24,18 @@ class FilteredBroker implements SocketBroker {
         if (this.subscribeFailure !== null) {
             throw this.subscribeFailure;
         }
+        this.lastFailed = failed;
 
-        return this.shared.subscribe(subject, deliver, failed);
+        return this.shared.subscribe(subject, (payload: string): void => {
+            if (this.receiving) {
+                deliver(payload);
+            }
+        }, failed);
+    }
+
+    public partition(cut: boolean): void {
+        this.receiving = !cut;
+        this.filter = (): boolean => !cut;
     }
 }
 
@@ -195,6 +207,74 @@ describe("socket presence", () => {
         expect(c.calls).toEqual([]);
     });
 
+    it("keeps the left of a stopped instance with the survivors when a lower id starts during the hold", async () => {
+        const b: Instance = instance('b');
+        const c: Instance = instance('c');
+        advance(SocketPresence.DEFAULTS.syncWaitMs);
+        c.presence.enter('room:1', 7);
+        forget(b, c);
+
+        c.presence.stop();
+        advance(1500);
+        const a: Instance = instance('a');
+        advance(10000);
+
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [7]}}]);
+        expect([...a.calls, ...c.calls]).toEqual([]);
+        expect(await a.presence.members('room:1')).toEqual([]);
+        expect(await b.presence.members('room:1')).toEqual([]);
+    });
+
+    it("keeps the left of a silent instance with the survivors when a lower id starts before the expiry", async () => {
+        const b: Instance = instance('b');
+        const c: Instance = instance('c');
+        advance(SocketPresence.DEFAULTS.syncWaitMs);
+        c.presence.enter('room:1', 7);
+        forget(b, c);
+
+        c.broker.partition(true);
+        advance(3000);
+        const a: Instance = instance('a');
+        advance(40000);
+
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [7]}}]);
+        expect(a.calls).toEqual([]);
+        expect(await a.presence.members('room:1')).toEqual([]);
+        expect(await b.presence.members('room:1')).toEqual([]);
+    });
+
+    it("hands the left of a stopped instance to a lower id that started before the bye", () => {
+        const b: Instance = instance('b');
+        const c: Instance = instance('c');
+        advance(SocketPresence.DEFAULTS.syncWaitMs);
+        c.presence.enter('room:1', 7);
+        const a: Instance = instance('a');
+        advance(SocketPresence.DEFAULTS.syncWaitMs);
+        forget(a, b, c);
+
+        c.presence.stop();
+        advance(SocketPresence.DEFAULTS.graceMs + 1);
+
+        expect(a.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [7]}}]);
+        expect([...b.calls, ...c.calls]).toEqual([]);
+    });
+
+    it("keeps the left of a stopped instance with the survivors when a higher id starts during the hold", () => {
+        const b: Instance = instance('b');
+        const c: Instance = instance('c');
+        advance(SocketPresence.DEFAULTS.syncWaitMs);
+        c.presence.enter('room:1', 7);
+        forget(b, c);
+
+        c.presence.stop();
+        advance(1500);
+        const d: Instance = instance('d');
+        advance(10000);
+
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [7]}}]);
+        expect([...c.calls, ...d.calls]).toEqual([]);
+    });
+
     it("does not blink on a rolling restart when clients reconnect within the grace", async () => {
         const [a, b, c]: Instance[] = cluster(3);
         c.presence.enter('room:1', 7);
@@ -254,6 +334,54 @@ describe("socket presence", () => {
         expect(a.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [3, 7]}}]);
         expect(b.calls).toEqual([]);
         expect(c.calls).toEqual([]);
+    });
+
+    it("reports joined again on both sides when a partition longer than expireMs heals", async () => {
+        const [a, b]: Instance[] = cluster(2);
+        a.presence.enter('room:1', 3);
+        b.presence.enter('room:1', 7);
+        forget(a, b);
+
+        a.broker.partition(true);
+        advance(31000);
+        expect(a.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [7]}}]);
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [3]}}]);
+        forget(a, b);
+
+        a.broker.partition(false);
+        advance(25000);
+
+        expect(a.calls).toEqual([{channel: 'room:1', change: {joined: [7], left: []}}]);
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [3], left: []}}]);
+        expect(await a.presence.members('room:1')).toEqual([3, 7]);
+        expect(await b.presence.members('room:1')).toEqual([3, 7]);
+    });
+
+    it("reports joined after a heal only for accounts absent from the rest of the view", () => {
+        const [a, b, c]: Instance[] = cluster(3);
+        a.presence.enter('room:1', 3);
+        a.presence.enter('room:1', 5);
+        b.presence.enter('room:1', 5);
+        forget(a, b, c);
+
+        a.broker.partition(true);
+        advance(31000);
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [], left: [3]}}]);
+        expect(c.calls).toEqual([]);
+        forget(a, b, c);
+
+        a.broker.partition(false);
+        advance(25000);
+
+        expect(b.calls).toEqual([{channel: 'room:1', change: {joined: [3], left: []}}]);
+        expect(c.calls).toEqual([{channel: 'room:1', change: {joined: [3], left: []}}]);
+        expect(a.calls).toEqual([]);
+        forget(a, b, c);
+        a.presence.enter('room:1', 9);
+        advance(25000);
+
+        expect(a.calls).toEqual([{channel: 'room:1', change: {joined: [9], left: []}}]);
+        expect([...b.calls, ...c.calls]).toEqual([]);
     });
 
     it("hands off every channel of a silent instance whose last message touched only one of them", () => {

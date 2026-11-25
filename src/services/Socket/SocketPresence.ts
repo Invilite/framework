@@ -28,10 +28,17 @@ interface RemoteChannel {
 }
 
 interface RemoteInstance {
+    firstSeenAt: number;
     seenAt: number;
     heartbeatAt: number | null;
+    rebuildUntil: number | null;
     expiry: NodeJS.Timeout;
     channels: Map<string, RemoteChannel>;
+}
+
+interface HeldInstance {
+    channels: Map<string, Set<number>>;
+    deciders: string[];
 }
 
 export class SocketPresence {
@@ -49,7 +56,8 @@ export class SocketPresence {
     private readonly graces: Map<string, Map<number, NodeJS.Timeout>> = new Map<string, Map<number, NodeJS.Timeout>>();
     private readonly pendingJoins: Map<string, Set<number>> = new Map<string, Set<number>>();
     private readonly remotes: Map<string, RemoteInstance> = new Map<string, RemoteInstance>();
-    private readonly holding: Set<Map<string, Set<number>>> = new Set<Map<string, Set<number>>>();
+    private readonly holding: Set<HeldInstance> = new Set<HeldInstance>();
+    private readonly expiredBySilence: Map<string, NodeJS.Timeout> = new Map<string, NodeJS.Timeout>();
     private readonly timers: Set<NodeJS.Timeout> = new Set<NodeJS.Timeout>();
     private readonly syncWaiters: Array<() => void> = [];
     private log: AbstractLogger | null = null;
@@ -116,6 +124,7 @@ export class SocketPresence {
         this.pendingJoins.clear();
         this.remotes.clear();
         this.holding.clear();
+        this.expiredBySilence.clear();
     }
 
     public enter(channel: string, userId: number): void {
@@ -265,7 +274,7 @@ export class SocketPresence {
             return;
         }
         if (message.kind === 'bye') {
-            this.depart(message.instanceId, this.timing.graceMs);
+            this.depart(message.instanceId, false);
             return;
         }
         const remote: RemoteInstance = this.heard(message.instanceId);
@@ -287,10 +296,18 @@ export class SocketPresence {
     }
 
     private heard(instanceId: string): RemoteInstance {
-        const expiry: NodeJS.Timeout = this.schedule(this.timing.expireMs, (): void => this.depart(instanceId, 0));
+        const expiry: NodeJS.Timeout = this.schedule(this.timing.expireMs, (): void => this.depart(instanceId, true));
         const remote: RemoteInstance | undefined = this.remotes.get(instanceId);
         if (remote === undefined) {
-            const created: RemoteInstance = {seenAt: this.now(), heartbeatAt: null, expiry, channels: new Map<string, RemoteChannel>()};
+            const now: number = this.now();
+            const created: RemoteInstance = {
+                firstSeenAt: now,
+                seenAt: now,
+                heartbeatAt: null,
+                rebuildUntil: this.returnedFromSilence(instanceId) ? now + this.timing.heartbeatMs * 1.5 : null,
+                expiry,
+                channels: new Map<string, RemoteChannel>(),
+            };
             this.remotes.set(instanceId, created);
 
             return created;
@@ -302,7 +319,28 @@ export class SocketPresence {
         return remote;
     }
 
+    private returnedFromSilence(instanceId: string): boolean {
+        const forgetTimer: NodeJS.Timeout | undefined = this.expiredBySilence.get(instanceId);
+        if (forgetTimer === undefined) {
+            return false;
+        }
+        this.cancel(forgetTimer);
+        this.expiredBySilence.delete(instanceId);
+
+        return true;
+    }
+
     private updateRemote(remote: RemoteInstance, instanceId: string, kind: 'state' | 'joined' | 'left', channel: string, accounts: number[]): void {
+        const rejoined: number[] = kind !== 'left' && remote.rebuildUntil !== null && this.now() <= remote.rebuildUntil
+            ? SocketPresence.sorted(accounts).filter((userId: number): boolean => !this.isLocal(channel, userId) && !this.isRemote(channel, userId) && !this.isHeld(channel, userId, null))
+            : [];
+        this.applyRemote(remote, instanceId, kind, channel, accounts);
+        if (rejoined.length > 0) {
+            this.changed(channel, {joined: rejoined, left: []});
+        }
+    }
+
+    private applyRemote(remote: RemoteInstance, instanceId: string, kind: 'state' | 'joined' | 'left', channel: string, accounts: number[]): void {
         const entry: RemoteChannel | undefined = remote.channels.get(channel);
         if (kind === 'left') {
             for (const userId of accounts) {
@@ -347,7 +385,7 @@ export class SocketPresence {
             return;
         }
         if (this.now() - remote.seenAt >= this.timing.expireMs) {
-            this.depart(instanceId, 0);
+            this.depart(instanceId, true);
             return;
         }
         const entry: RemoteChannel | undefined = remote.channels.get(channel);
@@ -358,35 +396,58 @@ export class SocketPresence {
         this.dropRemoteChannel(remote, channel);
     }
 
-    private depart(instanceId: string, holdMs: number): void {
+    private depart(instanceId: string, silent: boolean): void {
         const remote: RemoteInstance | undefined = this.remotes.get(instanceId);
         if (remote === undefined) {
             return;
         }
         this.remotes.delete(instanceId);
         this.cancel(remote.expiry);
-        const held: Map<string, Set<number>> = new Map<string, Set<number>>();
+        if (silent) {
+            this.rememberSilence(instanceId);
+        }
+        const channels: Map<string, Set<number>> = new Map<string, Set<number>>();
         for (const [channel, entry] of remote.channels) {
             this.cancel(entry.expiry);
-            held.set(channel, entry.accounts);
+            channels.set(channel, entry.accounts);
         }
-        if (held.size === 0) {
+        if (channels.size === 0) {
             return;
         }
+        const lastHeardAt: number = silent ? remote.seenAt : this.now();
+        const deciders: string[] = [this.instanceId];
+        for (const [other, otherRemote] of this.liveRemotes()) {
+            if (otherRemote.firstSeenAt <= lastHeardAt) {
+                deciders.push(other);
+            }
+        }
+        const held: HeldInstance = {channels, deciders};
         this.holding.add(held);
-        if (holdMs === 0) {
+        if (silent) {
             this.releaseHeld(held);
         } else {
-            this.schedule(holdMs, (): void => this.releaseHeld(held));
+            this.schedule(this.timing.graceMs, (): void => this.releaseHeld(held));
         }
     }
 
-    private releaseHeld(held: Map<string, Set<number>>): void {
+    private rememberSilence(instanceId: string): void {
+        const previous: NodeJS.Timeout | undefined = this.expiredBySilence.get(instanceId);
+        if (previous !== undefined) {
+            this.cancel(previous);
+        }
+        this.expiredBySilence.set(instanceId, this.schedule(this.timing.expireMs * 10, (): void => {
+            this.expiredBySilence.delete(instanceId);
+        }));
+    }
+
+    private releaseHeld(held: HeldInstance): void {
         this.holding.delete(held);
-        if (this.lowestLiveInstance() !== this.instanceId) {
+        const live: Map<string, RemoteInstance> = this.liveRemotes();
+        const decider: string = held.deciders.filter((instanceId: string): boolean => instanceId === this.instanceId || live.has(instanceId)).sort()[0];
+        if (decider !== this.instanceId) {
             return;
         }
-        for (const [channel, accounts] of held) {
+        for (const [channel, accounts] of held.channels) {
             const left: number[] = SocketPresence.sorted(accounts).filter((userId: number): boolean =>
                 !this.isLocal(channel, userId) && !this.isRemote(channel, userId) && !this.isHeld(channel, userId, held));
             if (left.length > 0) {
@@ -395,16 +456,10 @@ export class SocketPresence {
         }
     }
 
-    private lowestLiveInstance(): string {
+    private liveRemotes(): Map<string, RemoteInstance> {
         const now: number = this.now();
-        let lowest: string = this.instanceId;
-        for (const [instanceId, remote] of this.remotes) {
-            if (now - remote.seenAt < this.timing.expireMs && instanceId < lowest) {
-                lowest = instanceId;
-            }
-        }
 
-        return lowest;
+        return new Map<string, RemoteInstance>([...this.remotes].filter(([, remote]: [string, RemoteInstance]): boolean => now - remote.seenAt < this.timing.expireMs));
     }
 
     private changed(channel: string, change: SocketPresenceChange): void {
@@ -440,9 +495,9 @@ export class SocketPresence {
         return false;
     }
 
-    private isHeld(channel: string, userId: number, except: Map<string, Set<number>> | null): boolean {
+    private isHeld(channel: string, userId: number, except: HeldInstance | null): boolean {
         for (const held of this.holding) {
-            if (held !== except && held.get(channel)?.has(userId)) {
+            if (held !== except && held.channels.get(channel)?.has(userId)) {
                 return true;
             }
         }
@@ -462,7 +517,7 @@ export class SocketPresence {
             }
         }
         for (const held of this.holding) {
-            for (const userId of held.get(channel) ?? []) {
+            for (const userId of held.channels.get(channel) ?? []) {
                 accounts.add(userId);
             }
         }
