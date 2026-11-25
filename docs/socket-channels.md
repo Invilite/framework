@@ -135,7 +135,7 @@ Instances talk over the existing broker, on one subject `<prefix>.presence`, wit
 How the cases resolve:
 
 - An instance that stops (`bye`) or goes silent (`expireMs`) has its accounts held for `graceMs` (none after an expiry, which is already late). Then one instance calls `left` for the held accounts present nowhere else; the others only drop them. An account is also kept if it is in a holding set of another stopped instance, so a rolling restart does not blink.
-- Who decides a hold: when an instance departs, every survivor fixes the candidates, itself and the live instances it first heard no later than the departed instance's last message (`bye` included). When the hold ends, the lowest candidate that is still live decides. An instance that appeared later is never a candidate: it has not seen the departed instance's accounts, so it could not decide their `left`.
+- Who decides a hold: when an instance departs, every survivor fixes the candidates: itself and the live instances it first heard no later than the departed instance's last message (`bye` or final state). When the hold ends, the lowest candidate that is still live decides. An instance first heard after that message is not a candidate, because it has not seen the departed instance's accounts.
 - The reply to `sync` carries `alive` too, so all instances agree on who is live.
 - A channel entry of an instance that stays alive but stops reporting it (a lost `left`) is dropped without a call, but only while that instance sent `alive` within 1.5 x `heartbeatMs`; otherwise it waits for the instance expiry, which hands every channel over as above.
 - A partition longer than `expireMs` gives a `left` on both sides for the accounts of the other. An instance that was expired by silence (not `bye`) and is heard again within 10 x `expireMs` is rebuilt for 1.5 x `heartbeatMs`: for every account it reports that is present nowhere else in its own view (local, other instances, holding sets), each observer calls `joined`. Every observer does it, not only one, because the `left` was decided while the sides could not hear each other.
@@ -146,7 +146,8 @@ Accepted races. Consumers treat `joined` of an account already present, and `lef
 
 - Two instances deciding the join of one account at the same moment: two `joined`.
 - A reconnect message arriving just after a grace check: `left`, then `joined`.
-- A fresh instance does not see the holding sets of the others, so a client of a just stopped instance that reconnects to a brand-new instance can produce a duplicate `joined`. The `left` of the stopped instance's accounts stays with the survivors (the candidate rule above).
+- A fresh instance does not see the holding sets of the others, so a client of a just stopped instance that reconnects to a brand-new instance can produce a duplicate `joined`.
+- A newcomer whose first message reaches a survivor before the departed instance's last message, within broker latency, becomes a candidate without having heard that instance's state, so one `left` can be lost. The next `members()` read heals it.
 - Another instance's grace ending inside a fresh instance's sync window can produce `left` and then `joined`.
 - The last subscriptions of one account on two instances ending within broker latency: each grace ends while the other instance's entry is still there, so the `left` can be lost. It does not heal by itself; `members()` is right once the `left` messages arrive.
 - A healed partition (above): a duplicate `joined` from every observer, and from the returning instance's own joins decided during the rebuild window.

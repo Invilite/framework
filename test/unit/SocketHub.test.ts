@@ -585,6 +585,23 @@ describe("socket hub", () => {
         expect(presenceCalls).toEqual([]);
     });
 
+    it("never tracks an account id that is not a positive safe integer", async () => {
+        registerRoom(true, (): boolean => true);
+        const userIds: number[] = [0, -3, 1.5, 2 ** 53];
+        for (const userId of userIds) {
+            const client: Client = connect(userId);
+            client.hub.receive('{"op":"sub","ch":"room:1"}');
+            await flush();
+            expect(client.peer.last()).toEqual({op: 'subscribed', ch: 'room:1'});
+            expect(() => client.hub.receive('{"op":"unsub","ch":"room:1"}')).not.toThrow();
+            await flush();
+            expect(() => client.hub.closed()).not.toThrow();
+            await flush();
+        }
+
+        expect(presenceCalls).toEqual([]);
+    });
+
     it("exits a subscription whose join finished after the disconnect", async () => {
         let release: (allowed: boolean) => void = (): void => undefined;
         registerRoom(true, (): Promise<boolean> => new Promise<boolean>((resolve: (allowed: boolean) => void): void => {

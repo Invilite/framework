@@ -502,7 +502,12 @@ export class SocketHub {
     }
 
     private tracks(member: Member, subscription: Subscription): boolean {
-        return this.presence !== null && subscription.handlers?.presence === true && member.connection.userId !== null;
+        const userId: number | null = member.connection.userId;
+        return this.presence !== null
+            && subscription.handlers?.presence === true
+            && userId !== null
+            && Number.isSafeInteger(userId)
+            && userId > 0;
     }
 
     private async runLeave(handlers: SocketChannelHandlers, context: SocketContext): Promise<void> {
