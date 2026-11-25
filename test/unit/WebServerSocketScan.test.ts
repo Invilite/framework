@@ -11,6 +11,8 @@ import {SocketChannel, SocketEndpoint, SocketMessage} from "../../src/decorators
 import {AuthService} from "../../src/services/AuthService";
 import {MemorySocketBroker} from "../../src/services/Socket/MemorySocketBroker";
 import {SocketPublisher} from "../../src/services/Socket/SocketPublisher";
+import {SocketPresence} from "../../src/services/Socket/SocketPresence";
+import {SocketPresenceChange} from "../../src/types/interfaces/SocketPresenceChange";
 
 const authService: AuthService = new AuthService('HS256', 'scan-secret', 'scan-secret', 'socket-scan-test');
 
@@ -74,6 +76,30 @@ class UpperRoom extends Room {
 
 @SocketChannel('plain')
 class PlainChannel {
+}
+
+@SocketChannel('room', {presence: true, endpoint: '/socket'})
+class PresentRoom extends AbstractSocketController {
+    public static readonly created: PresentRoom[] = [];
+
+    public readonly changes: {channel: string; change: SocketPresenceChange}[] = [];
+
+    public constructor() {
+        super();
+        PresentRoom.created.push(this);
+    }
+
+    public join(): boolean {
+        return true;
+    }
+
+    public presenceChanged(channel: string, change: SocketPresenceChange): void {
+        this.changes.push({channel, change});
+    }
+}
+
+@SocketChannel('room', {presence: true, endpoint: '/other'})
+class OtherPresentRoom extends PresentRoom {
 }
 
 class Messages extends AbstractSocketController {
@@ -166,6 +192,51 @@ describe("socket classes found by the WebServer scan", () => {
     it("refuses an endpoint on a path a @WebSocketListener already serves", () => {
         expect(() => build([Endpoint], true, ['/socket'])).toThrow(/already a @WebSocketListener path/);
         expect(() => build([Endpoint], true, ['/other'])).not.toThrow();
+    });
+
+    it("stops the start for a presence channel without options.socket.presence", () => {
+        expect(() => build([Endpoint, PresentRoom])).toThrow(/PresentRoom.*needs WebServerOptions\.socket\.presence/);
+    });
+
+    it("refuses one presence channel type on two endpoints", () => {
+        const presence: SocketPresence = new SocketPresence(new SocketPublisher(new MemorySocketBroker()));
+        const registry: SocketRegistry = new SocketRegistry();
+        for (const target of [Endpoint, OtherEndpoint, PresentRoom, OtherPresentRoom]) {
+            registry.collect(target, target.name, `${target.name}.ts`);
+        }
+        const base: SocketRegistryContext = context();
+        const options: NonNullable<SocketRegistryContext['options']> = {...(base.options as NonNullable<SocketRegistryContext['options']>), presence};
+
+        expect(() => registry.build({...base, options})).toThrow(/OtherPresentRoom.*already/);
+        registry.close();
+    });
+
+    describe("with presence", () => {
+        beforeEach(() => {
+            jest.useFakeTimers();
+        });
+
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        it("routes presenceChanged to the channel controller", () => {
+            const presence: SocketPresence = new SocketPresence(new SocketPublisher(new MemorySocketBroker()));
+            const registry: SocketRegistry = new SocketRegistry();
+            for (const target of [Endpoint, PresentRoom]) {
+                registry.collect(target, target.name, `${target.name}.ts`);
+            }
+            const base: SocketRegistryContext = context();
+            const options: NonNullable<SocketRegistryContext['options']> = {...(base.options as NonNullable<SocketRegistryContext['options']>), presence};
+            registry.build({...base, options});
+            jest.advanceTimersByTime(SocketPresence.DEFAULTS.syncWaitMs);
+
+            presence.enter('room:1', 7);
+            registry.close();
+
+            const instance: PresentRoom = PresentRoom.created[PresentRoom.created.length - 1];
+            expect(instance.changes).toEqual([{channel: 'room:1', change: {joined: [7], left: []}}]);
+        });
     });
 
     it("stops the WebServer instead of logging the mistake like a broken HTTP controller", () => {

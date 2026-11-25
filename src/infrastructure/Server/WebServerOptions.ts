@@ -3,6 +3,7 @@ import {Request, Response} from "express";
 import {ServeStaticOptions} from "serve-static";
 import {SessionService} from "../../services/Session/SessionService";
 import {SocketPublisher} from "../../services/Socket/SocketPublisher";
+import {SocketPresence} from "../../services/Socket/SocketPresence";
 import {SocketLimits} from "./socket/SocketHub";
 
 /** Required as soon as a controllers directory has a @SocketEndpoint. */
@@ -10,6 +11,7 @@ export interface WebServerSocketOptions {
     /** The one in the ServiceContainer: the hubs take its broker and subject prefix, so they cannot drift apart. */
     publisher: SocketPublisher;
     limits?: Partial<SocketLimits>;
+    presence?: SocketPresence;
 }
 
 export interface ServeStatic {

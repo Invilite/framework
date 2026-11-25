@@ -8,6 +8,8 @@ import {Class} from "../../utils/Class";
 import SocketServer, {SocketUpgradeDecision} from "./SocketServer";
 import {WebServerSocketOptions} from "./WebServerOptions";
 import {SocketHub, SocketHubConnection, SocketMessageHandler, SocketPeer, SocketSessionCheck} from "./socket/SocketHub";
+import {SocketPresence} from "../../services/Socket/SocketPresence";
+import {SocketPresenceChange} from "../../types/interfaces/SocketPresenceChange";
 import {SocketProtocol} from "./socket/SocketProtocol";
 import {AbstractSocketController} from "../../controllers/AbstractSocketController";
 import {AbstractSocketEndpoint} from "../../controllers/AbstractSocketEndpoint";
@@ -70,6 +72,8 @@ export class SocketRegistry {
     private readonly scanned: ScannedClass[] = [];
     private readonly endpoints: Map<string, Endpoint> = new Map<string, Endpoint>();
     private readonly socketServers: SocketServer[] = [];
+    private readonly presenceTypes: Map<string, string> = new Map<string, string>();
+    private presence: SocketPresence | null = null;
     private clientFiles: Map<string, ClientFile> | null = null;
 
     /** True for a class this registry takes over from the controller scan. */
@@ -100,7 +104,7 @@ export class SocketRegistry {
             this.loadClientFiles();
         }
         for (const scanned of channelClasses) {
-            this.buildChannel(scanned, context.controllerParams);
+            this.buildChannel(scanned, context);
         }
         for (const endpoint of this.endpoints.values()) {
             this.serve(endpoint, context);
@@ -142,6 +146,7 @@ export class SocketRegistry {
         for (const endpoint of this.endpoints.values()) {
             endpoint.hub.stop();
         }
+        this.presence?.stop();
     }
 
     /** @RequiresAuth of a socket entry: like HTTP, no roles = an account (401), roles = hidden from anyone without them (404). */
@@ -173,12 +178,14 @@ export class SocketRegistry {
             subjectPrefix: options.publisher.subjectPrefix,
             log: context.logger,
             limits: options.limits,
+            presence: options.presence,
             disconnect: (connection: SocketConnection): void | Promise<void> => instance.disconnect?.(connection),
         });
         this.endpoints.set(definition.path, {path: definition.path, instance, hub});
     }
 
-    private buildChannel(scanned: ScannedClass, controllerParams: unknown[] | undefined): void {
+    private buildChannel(scanned: ScannedClass, context: SocketRegistryContext): void {
+        const controllerParams: unknown[] | undefined = context.controllerParams;
         const definition: SocketChannelDefinition | null = readSocketChannel(scanned.target);
         this.ensure(definition !== null, scanned, '@SocketMessage needs @SocketChannel on the class');
         const channel: SocketChannelDefinition = definition as SocketChannelDefinition;
@@ -195,6 +202,13 @@ export class SocketRegistry {
             messages.set(message.type, SocketRegistry.messageHandler(instance, message));
         }
 
+        const presence: SocketPresence | undefined = context.options?.presence;
+        if (channel.presence) {
+            this.ensure(presence !== undefined, scanned, 'a presence channel needs WebServerOptions.socket.presence');
+            const claimedBy: string | undefined = this.presenceTypes.get(channel.type);
+            this.ensure(claimedBy === undefined || claimedBy === endpoint.path, scanned, `presence channel type "${channel.type}" is already used on "${claimedBy}"`);
+        }
+
         try {
             endpoint.hub.register(channel.type, {
                 lossy: channel.lossy,
@@ -206,6 +220,20 @@ export class SocketRegistry {
         } catch (error) {
             this.ensure(false, scanned, (error as Error).message);
         }
+
+        if (channel.presence) {
+            this.registerPresence(scanned, channel.type, endpoint, presence as SocketPresence, instance);
+        }
+    }
+
+    private registerPresence(scanned: ScannedClass, type: string, endpoint: Endpoint, presence: SocketPresence, instance: AbstractSocketController): void {
+        try {
+            presence.register(type, (channel: string, change: SocketPresenceChange): void | Promise<void> => instance.presenceChanged?.(channel, change));
+        } catch (error) {
+            this.ensure(false, scanned, (error as Error).message);
+        }
+        this.presenceTypes.set(type, endpoint.path);
+        this.presence = presence;
     }
 
     private static messageHandler(instance: AbstractSocketController, message: SocketMessageDefinition): SocketMessageHandler {
@@ -242,6 +270,9 @@ export class SocketRegistry {
         });
         this.socketServers.push(socketServer);
         endpoint.hub.start();
+        if (this.presence !== null) {
+            this.presence.start(context.logger);
+        }
 
         context.express.get(`${endpoint.path}/session`, (_request: express.Request, response: express.Response): void => {
             response.setHeader('Cache-Control', 'private, no-store');
