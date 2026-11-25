@@ -49,12 +49,31 @@ class RoomChannel extends AbstractSocketController {
     }
 }
 
+@SocketChannel('room', {presence: true})
+class PresentRoomChannel extends AbstractSocketController {
+    public join(): boolean {
+        return true;
+    }
+}
+
+@SocketChannel('order')
+class OrderChannel extends AbstractSocketController {
+    public join(): boolean {
+        return true;
+    }
+}
+
 describe("socket decorators", () => {
+    it("reads the presence option, off by default", () => {
+        expect(readSocketChannel(PresentRoomChannel)?.presence).toBe(true);
+        expect(readSocketChannel(OrderChannel)?.presence).toBe(false);
+    });
+
     it("record the endpoint, the channels and the messages of each class", () => {
         expect(readSocketEndpoint(SiteSocket)).toEqual({path: '/socket'});
         expect(readSocketEndpoint(TicketChannel)).toBeNull();
-        expect(readSocketChannel(TicketChannel)).toEqual({type: 'ticket', lossy: false, endpoint: null});
-        expect(readSocketChannel(RoomChannel)).toEqual({type: 'room', lossy: true, endpoint: '/admin'});
+        expect(readSocketChannel(TicketChannel)).toEqual({type: 'ticket', lossy: false, endpoint: null, presence: false});
+        expect(readSocketChannel(RoomChannel)).toEqual({type: 'room', lossy: true, endpoint: '/admin', presence: false});
         expect(readSocketMessages(TicketChannel)).toEqual([{type: 'editing', method: 'editing'}, {type: 'delivered', method: 'delivered'}]);
         expect(readSocketMessages(RoomChannel)).toEqual([]);
     });

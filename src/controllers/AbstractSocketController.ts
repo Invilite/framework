@@ -1,5 +1,6 @@
 import ServiceContainer from "../infrastructure/ServiceContainer";
 import {SocketContext} from "../types/interfaces/SocketContext";
+import {SocketPresenceChange} from "../types/interfaces/SocketPresenceChange";
 
 /**
  * Base of a @SocketChannel class: who may subscribe to a channel of its type and what its @SocketMessage methods do.
@@ -17,4 +18,6 @@ export abstract class AbstractSocketController<TAttributes extends object = Reco
 
     /** Once after every join that returned true: unsubscribe, disconnect or the server closing the connection. */
     public leave?(context: SocketContext<TAttributes>): void | Promise<void>;
+
+    public presenceChanged?(channel: string, change: SocketPresenceChange): void | Promise<void>;
 }
