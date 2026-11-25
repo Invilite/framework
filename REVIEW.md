@@ -302,6 +302,10 @@ Register of non-obvious behaviors in this framework: things that caused (or coul
    *Tell:* a new `server.on('upgrade', ...)`; `new URL(..., request.headers.host)`; an `await` in the upgrade path before the socket has an `error` handler; `emit('connection', ...)` replacing the listener loop.
    *Check:* `test/unit/SocketServerUpgrade.test.ts` ("SocketServer upgrade robustness") stays green. `src/infrastructure/Server/SocketServer.ts`.
 
+13. **`presenceChanged` runs on one instance per change.** The instance that decided it calls the hook once for the whole cluster, so state or sockets touched there reach only that instance's clients.
+    *Tell:* a `presenceChanged` that writes to a local map, `context.state` or local sockets instead of publishing; a publish from the `enter`/`exit` path of the presence.
+    *Check:* the hook publishes through `SocketPublisher` or writes shared storage; consumers treat `joined` of a present account and `left` of an absent one as no-ops and read `members()` for the truth. `src/services/Socket/SocketPresence.ts`.
+
 ---
 
 ## Storage

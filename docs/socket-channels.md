@@ -2,7 +2,7 @@
 
 One socket per browser, with `type:key` channels inside (for example `order:42`). The client subscribes, a channel controller decides in `join`, methods decorated with `@SocketMessage` handle messages from the client, and `SocketPublisher` sends events from anywhere in the application to every instance through a broker (NATS or in-memory).
 
-- Sources: `src/controllers/AbstractSocketEndpoint.ts`, `src/controllers/AbstractSocketController.ts`, `src/decorators/WebServer/{SocketEndpoint,SocketChannel,SocketMessage,RequiresAuth}.ts`, `src/infrastructure/Server/{SocketRegistry,SocketServer}.ts`, `src/infrastructure/Server/socket/` (`SocketHub`, `SocketProtocol`), `src/services/Socket/` (`SocketPublisher`, `NatsSocketBroker`, `MemorySocketBroker`), `src/client/socket/`
+- Sources: `src/controllers/AbstractSocketEndpoint.ts`, `src/controllers/AbstractSocketController.ts`, `src/decorators/WebServer/{SocketEndpoint,SocketChannel,SocketMessage,RequiresAuth}.ts`, `src/infrastructure/Server/{SocketRegistry,SocketServer}.ts`, `src/infrastructure/Server/socket/` (`SocketHub`, `SocketProtocol`), `src/services/Socket/` (`SocketPublisher`, `SocketPresence`, `NatsSocketBroker`, `MemorySocketBroker`), `src/client/socket/`
 - Implementation traps: `REVIEW.md`
 - A raw socket with your own protocol is still available through `@WebSocketListener(path)`, imported directly from `@invilite/framework/decorators/WebServer/WebSocketListener` (the `decorators/WebServer` index does not re-export it): the method receives `(ws, request)`.
 
@@ -52,7 +52,7 @@ export class OrderSocketController extends AbstractSocketController<AppConnectio
 }
 ```
 
-- `@SocketChannel(type, {lossy?, endpoint?})`: the type matches `[a-z]{1,32}` and must not be `user`; `lossy` marks channels whose events may be skipped for a slow client (chat, counters; never notifications); `endpoint` names the endpoint path, needed only when there is more than one endpoint. Like every controller, the class receives the `ServiceContainer` as its first controller parameter (`this.serviceContainer`).
+- `@SocketChannel(type, {lossy?, presence?, endpoint?})`: the type matches `[a-z]{1,32}` and must not be `user`; `lossy` marks channels whose events may be skipped for a slow client (chat, counters; never notifications); `presence` tracks the accounts in channels of this type (section 4); `endpoint` names the endpoint path, needed only when there is more than one endpoint. Like every controller, the class receives the `ServiceContainer` as its first controller parameter (`this.serviceContainer`).
 - `join` runs on every subscription (also after a reconnect): `true` subscribes, `false` refuses with `forbidden`, a thrown `SocketRefusalError` refuses with its code.
 - `leave` (optional): exactly once after every `join` that returned `true` (unsubscribe, disconnect, server close), always after the `@SocketMessage` method that was still running finishes. Messages queued for a subscription that was left get `not_subscribed`.
 - `context`: `connection` (`id`, `userId`, `attributes`), `channel` (`order:42`), `key` (`42`), and `state`, a mutable object of one connection in one channel, empty at `join`, gone after `leave`. One controller instance serves every connection, so per-connection state never goes into class fields.
@@ -80,11 +80,73 @@ publisher.toUser(42, 'notification', {id: 3});
 - Publish after the commit: nothing stored may depend on the event arriving. An event is at most 64 KiB, again measured in UTF-16 code units of the JSON payload, not bytes; an invalid channel or type name throws.
 - `MemorySocketBroker` delivers inside one process: enough for a single instance and for tests. Several instances need a shared broker such as `NatsSocketBroker`.
 
-## 4. The personal channel
+## 4. Presence
+
+Which accounts are in a channel, across all instances: a room list, a viewer count. The framework tracks and decides; what is shown to browsers stays with the application (it never sends account ids by itself).
+
+```ts
+@SocketChannel('room', {presence: true})
+export class RoomSocketController extends AbstractSocketController<AppConnectionAttributes> {
+
+    public async join(context: SocketContext<AppConnectionAttributes>): Promise<boolean> {
+        return context.connection.userId !== null;
+    }
+
+    public presenceChanged(channel: string, change: SocketPresenceChange): void {
+        this.serviceContainer.get<SocketPublisher>('SocketPublisher').publish(channel, 'presence.changed', change);
+    }
+}
+
+const presence: SocketPresence = new SocketPresence(publisher, {graceMs: 5000});
+serviceContainer.register(presence, 'SocketPresence');
+
+const webServer: WebServer = new WebServer(logger, {
+    // ...
+    socket: {publisher, presence},
+}, authService, tokenBlacklist);
+
+const accounts: number[] = await presence.members('room:42');
+```
+
+- `@SocketChannel(type, {presence: true})`: after every successful `join` the hub counts the account in the channel, and `leave` uncounts it. Guests (`userId === null`) are never tracked. Several tabs or connections of one account count as one member.
+- `SocketPresence` takes the broker and the subject prefix from the publisher, like the hubs; create it next to the publisher and register it as `'SocketPresence'`. `WebServer` starts and stops it with the sockets.
+- `members(channel)` resolves with the account ids present on any instance, ascending, including accounts in a grace period. Until the first sync window after the start is over it waits, so it never answers from an empty view.
+- `presenceChanged(channel, change)` (optional, on the channel controller) gets `SocketPresenceChange = {joined: number[]; left: number[]}`. An exception, or a rejected promise, is logged.
+- `joined` is called when an account enters a channel it was in nowhere in the cluster; `left` when it is gone everywhere, after the grace period. A second tab, a second instance, a page reload and a reconnect to another instance within `graceMs` call nothing.
+- A start error: a `presence: true` channel without `options.socket.presence`, or one presence channel type on two endpoints.
+
+`presenceChanged` runs once per cluster, on the instance that decided the change, so a client connected to another instance learns about it only if the controller publishes through `SocketPublisher` (or writes shared storage). Work done there on local state or local sockets reaches only the clients of that instance.
+
+Instances talk over the existing broker, on one subject `<prefix>.presence`, with JSON messages that carry a protocol version and a random instance id (a new one at every process start): `state` (the accounts of one channel on the sender), `joined` and `left` (a local change), `alive`, `sync` (a fresh instance asks for state) and `bye` (at `stop()`). `members` is the union of local, remote and held accounts.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `graceMs` | 5000 | an account that left its last local subscription stays present for this long; also how long accounts of a stopped instance are held |
+| `heartbeatMs` | 10000 | `alive` and one `state` per channel with local accounts, at this interval |
+| `expireMs` | 30000 | an instance silent for this long is gone; also the lifetime of a channel entry |
+| `syncWaitMs` | 1000 | after the start the instance only listens; its joins are decided after this window |
+
+`now` and `instanceId` can be set too (tests). Timers do not keep the process alive.
+
+How the cases resolve:
+
+- An instance that stops (`bye`) or goes silent (`expireMs`) has its accounts held for `graceMs` (none after an expiry, which is already late). Then the live instance with the lowest id calls `left` for the held accounts present nowhere else; the others only drop them. An account is also kept if it is in a holding set of another stopped instance, so a rolling restart does not blink.
+- The reply to `sync` carries `alive` too, so all instances agree on the lowest live instance.
+- A channel entry of an instance that stays alive but stops reporting it (a lost `left`) is dropped without a call, but only while that instance sent `alive` within `heartbeatMs`; otherwise it waits for the instance expiry, which hands every channel to the lowest live instance.
+- After the broker reports the subscription `failed`, or refuses `subscribe`, the presence subscribes and syncs again on the next heartbeat. Publish and subscribe errors are logged.
+
+Accepted races. Consumers treat `joined` of an account already present, and `left` of an absent one, as no-ops; `members()` is the truth.
+
+- Two instances deciding the join of one account at the same moment: two `joined`.
+- A reconnect message arriving just after a grace check: `left`, then `joined`.
+- A fresh instance does not see the holding sets of the others, so a client of a just stopped instance that reconnects to a brand-new instance can produce a duplicate `joined`.
+- Another instance's grace ending inside a fresh instance's sync window can produce `left` and then `joined`.
+
+## 5. The personal channel
 
 The client subscribes to the bare `user`; the server maps it to the connection's own account, a guest gets `forbidden`. Only `publisher.toUser` writes there. A message from the client to `user` gets `unsupported`.
 
-## 5. Errors
+## 6. Errors
 
 | What | The client gets |
 |---|---|
@@ -99,15 +161,15 @@ Protocol mistakes get `bad_frame`, `bad_channel`, `unknown_channel`, `too_many_c
 
 A mistake in the socket classes at start (no `socket` in the options, an invalid type, two channels of one type, a channel without an endpoint, a wrong base class) stops the start: the `WebServer` constructor throws, naming the class.
 
-## 6. Options and limits
+## 7. Options and limits
 
-`WebServerOptions.socket = {publisher, limits?}`. The default limits: frame 16 KiB (also the `maxPayload` of the socket), 32 channels per connection, a token bucket of 40 frames refilled at 10 per second, a 256 KiB lossy buffer (above it `lossy` events are skipped), a 1 MiB hard buffer (above it the connection closes with 4009), silence 75 s (4408), a sweep every 30 s (also session revocation: 4401).
+`WebServerOptions.socket = {publisher, presence?, limits?}`; `presence` is required when any channel sets `presence: true`. The default limits: frame 16 KiB (also the `maxPayload` of the socket), 32 channels per connection, a token bucket of 40 frames refilled at 10 per second, a 256 KiB lossy buffer (above it `lossy` events are skipped), a 1 MiB hard buffer (above it the connection closes with 4009), silence 75 s (4408), a sweep every 30 s (also session revocation: 4401).
 
-## 7. Protocol
+## 8. Protocol
 
 Version 1, JSON text frames. From the client: `sub`, `unsub`, `send` (`ch`, `t`, `d`, `id`), `ping`. From the server: `hello` (`user`), `subscribed`, `event` (`ch`, `t`, `d`), `ack` (`id`, optionally `d`), `error` (`code`, `ch`, `id`), `pong`. Close codes: 4401 session revoked, 4408 idle, 4009 slow client, 1009 frame too large, 1012 broker subscription lost (the client reconnects and subscribes afresh). Broker subjects: `<prefix>.<type>.<key>` and `<prefix>.user.<id>`.
 
-## 8. Browser client
+## 9. Browser client
 
 In a layout: `{{{socketClient '/ws'}}}`, a Handlebars helper registered by `WebServer` that returns a `SafeString`: the script tag with versioned client files and the page's account. The client scripts ship with the framework and are served by the endpoint itself, so nothing has to be copied at build time. Page API (`window.WebSocketEvents`):
 
@@ -117,6 +179,6 @@ In a layout: `{{{socketClient '/ws'}}}`, a Handlebars helper registered by `WebS
 
 One connection for all tabs through a `SharedWorker` (a separate worker per endpoint), without it a connection per tab; reconnecting uses a random backoff capped at 30 s, and the connection pings every 25 s.
 
-## 9. Tests
+## 10. Tests
 
-Framework tests: `test/unit/Socket*.test.ts` (protocol, hub, publisher, decorators, browser client), `WebServerSocketScan.test.ts`, `SocketServerUpgrade.test.ts`. In an application: a `WebServer` with `socket: {publisher: new SocketPublisher(new MemorySocketBroker())}` and a `ws` client.
+Framework tests: `test/unit/Socket*.test.ts` (protocol, hub, publisher, presence, decorators, browser client), `WebServerSocketScan.test.ts`, `SocketServerUpgrade.test.ts`. In an application: a `WebServer` with `socket: {publisher: new SocketPublisher(new MemorySocketBroker())}` and a `ws` client.

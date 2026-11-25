@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). During 0.x a new feature or a breaking change bumps the minor version, a fix bumps the patch.
 
+## [0.3.0] - 2026-11-26
+
+### Added
+
+- `SocketPresence` (`services/Socket/SocketPresence`): which accounts are in a channel across instances, over the socket broker on `<prefix>.presence`; `members(channel)`, `enter`, `exit`, a grace period for reloads and reconnects, heartbeats, hand-off of a silent instance's channels to the lowest live instance. Options `graceMs`, `heartbeatMs`, `expireMs`, `syncWaitMs`.
+- `presence` option of `@SocketChannel(type, {presence: true})`: the hub tracks the accounts of channels of this type (guests are skipped).
+- `AbstractSocketController.presenceChanged?(channel, change)` and `SocketPresenceChange` (`types/interfaces/SocketPresenceChange`): called once per cluster with the accounts that joined or left.
+- `WebServerSocketOptions.presence`: required when a channel sets `presence: true`; a missing one, or one presence channel type on two endpoints, stops the start.
+
 ## [0.2.2] - 2026-11-24
 
 ### Added
