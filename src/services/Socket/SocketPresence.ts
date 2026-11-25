@@ -29,6 +29,7 @@ interface RemoteChannel {
 
 interface RemoteInstance {
     seenAt: number;
+    heartbeatAt: number | null;
     expiry: NodeJS.Timeout;
     channels: Map<string, RemoteChannel>;
 }
@@ -186,15 +187,20 @@ export class SocketPresence {
     }
 
     private subscribe(): void {
-        this.subscription = this.publisher.broker.subscribe(
-            this.subject,
-            (payload: string): void => this.receive(payload),
-            (error: Error): void => this.subscriptionFailed(error),
-        );
+        try {
+            this.subscription = this.publisher.broker.subscribe(
+                this.subject,
+                (payload: string): void => this.receive(payload),
+                (error: Error): void => this.subscriptionFailed(error),
+            );
+        } catch (error) {
+            this.subscriptionFailed(error);
+            return;
+        }
         this.publish({k: 'sync'});
     }
 
-    private subscriptionFailed(error: Error): void {
+    private subscriptionFailed(error: unknown): void {
         this.subscription = null;
         this.log?.error('Presence subscription failed:', error);
     }
@@ -264,6 +270,9 @@ export class SocketPresence {
         }
         const remote: RemoteInstance = this.heard(message.instanceId);
         switch (message.kind) {
+            case 'alive':
+                remote.heartbeatAt = this.now();
+                break;
             case 'sync':
                 this.announce();
                 break;
@@ -281,7 +290,7 @@ export class SocketPresence {
         const expiry: NodeJS.Timeout = this.schedule(this.timing.expireMs, (): void => this.depart(instanceId, 0));
         const remote: RemoteInstance | undefined = this.remotes.get(instanceId);
         if (remote === undefined) {
-            const created: RemoteInstance = {seenAt: this.now(), expiry, channels: new Map<string, RemoteChannel>()};
+            const created: RemoteInstance = {seenAt: this.now(), heartbeatAt: null, expiry, channels: new Map<string, RemoteChannel>()};
             this.remotes.set(instanceId, created);
 
             return created;
@@ -339,6 +348,11 @@ export class SocketPresence {
         }
         if (this.now() - remote.seenAt >= this.timing.expireMs) {
             this.depart(instanceId, 0);
+            return;
+        }
+        const entry: RemoteChannel | undefined = remote.channels.get(channel);
+        if (entry !== undefined && (remote.heartbeatAt === null || this.now() - remote.heartbeatAt > this.timing.heartbeatMs)) {
+            entry.expiry = this.schedule(this.timing.heartbeatMs, (): void => this.remoteChannelStale(instanceId, channel));
             return;
         }
         this.dropRemoteChannel(remote, channel);

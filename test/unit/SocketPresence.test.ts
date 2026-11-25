@@ -7,6 +7,7 @@ import {AbstractLogger} from "../../src/types/interfaces/AbstractLogger";
 
 class FilteredBroker implements SocketBroker {
     public filter: (payload: string) => boolean = (): boolean => true;
+    public subscribeFailure: Error | null = null;
 
     public constructor(private readonly shared: MemorySocketBroker) {
     }
@@ -18,6 +19,10 @@ class FilteredBroker implements SocketBroker {
     }
 
     public subscribe(subject: string, deliver: (payload: string) => void, failed: (error: Error) => void): SocketBrokerSubscription {
+        if (this.subscribeFailure !== null) {
+            throw this.subscribeFailure;
+        }
+
         return this.shared.subscribe(subject, deliver, failed);
     }
 }
@@ -251,6 +256,25 @@ describe("socket presence", () => {
         expect(c.calls).toEqual([]);
     });
 
+    it("hands off every channel of a silent instance whose last message touched only one of them", () => {
+        const [a, b, c]: Instance[] = cluster(3);
+        c.presence.enter('room:1', 7);
+        c.presence.enter('room:2', 5);
+        advance(SocketPresence.DEFAULTS.heartbeatMs);
+        advance(3000);
+        c.presence.enter('room:2', 9);
+        forget(c);
+
+        c.broker.filter = (): boolean => false;
+        advance(30001);
+
+        expect(a.calls).toEqual([
+            {channel: 'room:1', change: {joined: [], left: [7]}},
+            {channel: 'room:2', change: {joined: [], left: [5, 9]}},
+        ]);
+        expect([...b.calls, ...c.calls]).toEqual([]);
+    });
+
     it("drops a stale entry of a live instance without a call", async () => {
         const [a, b, c]: Instance[] = cluster(3);
         b.presence.enter('room:1', 7);
@@ -354,6 +378,22 @@ describe("socket presence", () => {
 
         expect(await a.presence.members('room:1')).toEqual([9]);
         expect(a.calls).toEqual([]);
+    });
+
+    it("keeps retrying on later heartbeats while the broker refuses to subscribe", async () => {
+        const [a, b]: Instance[] = cluster(2);
+        const closed: Error = new Error('connection closed');
+        a.broker.subscribeFailure = closed;
+        shared.fail('ws.presence');
+
+        expect(() => advance(SocketPresence.DEFAULTS.heartbeatMs)).not.toThrow();
+        expect(a.log.error).toHaveBeenCalledWith('Presence subscription failed:', closed);
+        b.presence.enter('room:1', 3);
+        a.broker.subscribeFailure = null;
+        advance(SocketPresence.DEFAULTS.heartbeatMs);
+        b.presence.enter('room:1', 7);
+
+        expect(await a.presence.members('room:1')).toEqual([3, 7]);
     });
 
     it("subscribes again on the next heartbeat after the broker ends the subscription", async () => {
