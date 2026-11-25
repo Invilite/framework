@@ -10,16 +10,16 @@ export interface SocketPresenceOptions {
     heartbeatMs?: number;
     expireMs?: number;
     syncWaitMs?: number;
-    now?: () => number;
     instanceId?: string;
 }
 
 export type SocketPresenceHandler = (channel: string, change: SocketPresenceChange) => void | Promise<void>;
 
-type SocketPresenceTiming = Required<Omit<SocketPresenceOptions, 'now' | 'instanceId'>>;
+type SocketPresenceTiming = Required<Omit<SocketPresenceOptions, 'instanceId'>>;
 
 type SocketPresenceMessage =
     | {kind: 'alive' | 'sync' | 'bye'; instanceId: string}
+    | {kind: 'unsupported'; instanceId: string; version: number}
     | {kind: 'state' | 'joined' | 'left'; instanceId: string; channel: string; accounts: number[]};
 
 interface RemoteChannel {
@@ -50,7 +50,6 @@ export class SocketPresence {
 
     private readonly subject: string;
     private readonly timing: SocketPresenceTiming;
-    private readonly now: () => number;
     private readonly handlers: Map<string, SocketPresenceHandler> = new Map<string, SocketPresenceHandler>();
     private readonly localCounts: Map<string, Map<number, number>> = new Map<string, Map<number, number>>();
     private readonly graces: Map<string, Map<number, NodeJS.Timeout>> = new Map<string, Map<number, NodeJS.Timeout>>();
@@ -58,17 +57,18 @@ export class SocketPresence {
     private readonly remotes: Map<string, RemoteInstance> = new Map<string, RemoteInstance>();
     private readonly holding: Set<HeldInstance> = new Set<HeldInstance>();
     private readonly expiredBySilence: Map<string, NodeJS.Timeout> = new Map<string, NodeJS.Timeout>();
+    private readonly unsupportedSenders: Set<string> = new Set<string>();
     private readonly timers: Set<NodeJS.Timeout> = new Set<NodeJS.Timeout>();
     private readonly syncWaiters: Array<() => void> = [];
     private log: AbstractLogger | null = null;
     private subscription: SocketBrokerSubscription | null = null;
     private heartbeat: NodeJS.Timeout | null = null;
     private running: boolean = false;
+    private stopped: boolean = false;
     private synced: boolean = false;
 
     public constructor(private readonly publisher: SocketPublisher, options: SocketPresenceOptions = {}) {
         this.instanceId = options.instanceId ?? randomUUID();
-        this.now = options.now ?? Date.now;
         this.timing = {
             graceMs: options.graceMs ?? SocketPresence.DEFAULTS.graceMs,
             heartbeatMs: options.heartbeatMs ?? SocketPresence.DEFAULTS.heartbeatMs,
@@ -93,6 +93,7 @@ export class SocketPresence {
             return;
         }
         this.running = true;
+        this.stopped = false;
         this.synced = false;
         this.log = log;
         this.subscribe();
@@ -105,12 +106,11 @@ export class SocketPresence {
         if (!this.running) {
             return;
         }
-        this.releaseSyncWaiters();
         this.publish({k: 'bye'});
         this.running = false;
+        this.stopped = true;
         this.synced = false;
-        this.subscription?.unsubscribe();
-        this.subscription = null;
+        this.endSubscription();
         if (this.heartbeat !== null) {
             clearInterval(this.heartbeat);
             this.heartbeat = null;
@@ -125,10 +125,13 @@ export class SocketPresence {
         this.remotes.clear();
         this.holding.clear();
         this.expiredBySilence.clear();
+        this.unsupportedSenders.clear();
+        this.releaseSyncWaiters();
     }
 
     public enter(channel: string, userId: number): void {
         this.requireTracked(channel);
+        SocketPresence.requireAccount(userId);
         if (!this.running) {
             return;
         }
@@ -156,6 +159,7 @@ export class SocketPresence {
 
     public exit(channel: string, userId: number): void {
         this.requireTracked(channel);
+        SocketPresence.requireAccount(userId);
         if (!this.running) {
             return;
         }
@@ -184,10 +188,13 @@ export class SocketPresence {
         this.graces.set(channel, graces);
     }
 
-    public members(channel: string): Promise<number[]> {
+    public async members(channel: string): Promise<number[]> {
         this.requireTracked(channel);
+        if (this.stopped) {
+            return [];
+        }
         if (this.synced) {
-            return Promise.resolve(this.list(channel));
+            return this.list(channel);
         }
 
         return new Promise<number[]>((resolve: (members: number[]) => void): void => {
@@ -210,8 +217,18 @@ export class SocketPresence {
     }
 
     private subscriptionFailed(error: unknown): void {
-        this.subscription = null;
+        this.endSubscription();
         this.log?.error('Presence subscription failed:', error);
+    }
+
+    private endSubscription(): void {
+        const subscription: SocketBrokerSubscription | null = this.subscription;
+        this.subscription = null;
+        try {
+            subscription?.unsubscribe();
+        } catch (error) {
+            this.log?.error('Presence unsubscribe failed:', error);
+        }
     }
 
     private beat(): void {
@@ -273,6 +290,10 @@ export class SocketPresence {
         if (message === null || message.instanceId === this.instanceId || !this.running) {
             return;
         }
+        if (message.kind === 'unsupported') {
+            this.unsupported(message.instanceId, message.version);
+            return;
+        }
         if (message.kind === 'bye') {
             this.depart(message.instanceId, false);
             return;
@@ -280,7 +301,7 @@ export class SocketPresence {
         const remote: RemoteInstance = this.heard(message.instanceId);
         switch (message.kind) {
             case 'alive':
-                remote.heartbeatAt = this.now();
+                remote.heartbeatAt = Date.now();
                 break;
             case 'sync':
                 this.announce();
@@ -295,11 +316,19 @@ export class SocketPresence {
         }
     }
 
+    private unsupported(instanceId: string, version: number): void {
+        if (this.unsupportedSenders.has(instanceId)) {
+            return;
+        }
+        this.unsupportedSenders.add(instanceId);
+        this.log?.warning(`Presence messages of protocol version ${version} from instance "${instanceId}" are ignored`);
+    }
+
     private heard(instanceId: string): RemoteInstance {
         const expiry: NodeJS.Timeout = this.schedule(this.timing.expireMs, (): void => this.depart(instanceId, true));
         const remote: RemoteInstance | undefined = this.remotes.get(instanceId);
         if (remote === undefined) {
-            const now: number = this.now();
+            const now: number = Date.now();
             const created: RemoteInstance = {
                 firstSeenAt: now,
                 seenAt: now,
@@ -314,7 +343,7 @@ export class SocketPresence {
         }
         this.cancel(remote.expiry);
         remote.expiry = expiry;
-        remote.seenAt = this.now();
+        remote.seenAt = Date.now();
 
         return remote;
     }
@@ -331,7 +360,7 @@ export class SocketPresence {
     }
 
     private updateRemote(remote: RemoteInstance, instanceId: string, kind: 'state' | 'joined' | 'left', channel: string, accounts: number[]): void {
-        const rejoined: number[] = kind !== 'left' && remote.rebuildUntil !== null && this.now() <= remote.rebuildUntil
+        const rejoined: number[] = kind !== 'left' && remote.rebuildUntil !== null && Date.now() <= remote.rebuildUntil
             ? SocketPresence.sorted(accounts).filter((userId: number): boolean => !this.isLocal(channel, userId) && !this.isRemote(channel, userId) && !this.isHeld(channel, userId, null))
             : [];
         this.applyRemote(remote, instanceId, kind, channel, accounts);
@@ -384,12 +413,12 @@ export class SocketPresence {
         if (remote === undefined) {
             return;
         }
-        if (this.now() - remote.seenAt >= this.timing.expireMs) {
+        if (Date.now() - remote.seenAt >= this.timing.expireMs) {
             this.depart(instanceId, true);
             return;
         }
         const entry: RemoteChannel | undefined = remote.channels.get(channel);
-        if (entry !== undefined && (remote.heartbeatAt === null || this.now() - remote.heartbeatAt > this.timing.heartbeatMs)) {
+        if (entry !== undefined && (remote.heartbeatAt === null || Date.now() - remote.heartbeatAt > this.timing.heartbeatMs * 1.5)) {
             entry.expiry = this.schedule(this.timing.heartbeatMs, (): void => this.remoteChannelStale(instanceId, channel));
             return;
         }
@@ -414,7 +443,7 @@ export class SocketPresence {
         if (channels.size === 0) {
             return;
         }
-        const lastHeardAt: number = silent ? remote.seenAt : this.now();
+        const lastHeardAt: number = silent ? remote.seenAt : Date.now();
         const deciders: string[] = [this.instanceId];
         for (const [other, otherRemote] of this.liveRemotes()) {
             if (otherRemote.firstSeenAt <= lastHeardAt) {
@@ -457,7 +486,7 @@ export class SocketPresence {
     }
 
     private liveRemotes(): Map<string, RemoteInstance> {
-        const now: number = this.now();
+        const now: number = Date.now();
 
         return new Map<string, RemoteInstance>([...this.remotes].filter(([, remote]: [string, RemoteInstance]): boolean => now - remote.seenAt < this.timing.expireMs));
     }
@@ -578,8 +607,11 @@ export class SocketPresence {
             return null;
         }
         const message: Record<string, unknown> = value as Record<string, unknown>;
-        if (message.v !== SocketPresence.VERSION || typeof message.i !== 'string' || message.i === '') {
+        if (typeof message.v !== 'number' || typeof message.i !== 'string' || message.i === '') {
             return null;
+        }
+        if (message.v !== SocketPresence.VERSION) {
+            return {kind: 'unsupported', instanceId: message.i, version: message.v};
         }
         switch (message.k) {
             case 'alive':
@@ -602,6 +634,16 @@ export class SocketPresence {
     }
 
     private static isAccountList(value: unknown): value is number[] {
-        return Array.isArray(value) && value.every((userId: unknown): boolean => Number.isInteger(userId) && (userId as number) > 0);
+        return Array.isArray(value) && value.every((userId: unknown): boolean => SocketPresence.isAccount(userId));
+    }
+
+    private static isAccount(value: unknown): value is number {
+        return Number.isSafeInteger(value) && (value as number) > 0;
+    }
+
+    private static requireAccount(userId: number): void {
+        if (!SocketPresence.isAccount(userId)) {
+            throw new Error(`Invalid presence account id ${userId}`);
+        }
     }
 }

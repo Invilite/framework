@@ -237,6 +237,49 @@ describe("socket classes found by the WebServer scan", () => {
             const instance: PresentRoom = PresentRoom.created[PresentRoom.created.length - 1];
             expect(instance.changes).toEqual([{channel: 'room:1', change: {joined: [7], left: []}}]);
         });
+
+        it("stops the presence with the registry and says bye", () => {
+            const broker: MemorySocketBroker = new MemorySocketBroker();
+            const presence: SocketPresence = new SocketPresence(new SocketPublisher(broker), {instanceId: 'a'});
+            const heard: string[] = [];
+            broker.subscribe('ws.presence', (payload: string): void => {
+                heard.push(payload);
+            }, (): void => undefined);
+            const registry: SocketRegistry = new SocketRegistry();
+            for (const target of [Endpoint, PresentRoom]) {
+                registry.collect(target, target.name, `${target.name}.ts`);
+            }
+            const base: SocketRegistryContext = context();
+            registry.build({...base, options: {...(base.options as NonNullable<SocketRegistryContext['options']>), presence}});
+            heard.length = 0;
+
+            registry.close();
+
+            expect(heard).toEqual([JSON.stringify({v: 1, i: 'a', k: 'bye'})]);
+            expect(broker.subjects()).toEqual(['ws.presence']);
+            expect(jest.getTimerCount()).toBe(0);
+        });
+
+        it("stops the presence when the WebServer closes", async () => {
+            const broker: MemorySocketBroker = new MemorySocketBroker();
+            const publisher: SocketPublisher = new SocketPublisher(broker);
+            const presence: SocketPresence = new SocketPresence(publisher, {instanceId: 'a'});
+            const heard: string[] = [];
+            broker.subscribe('ws.presence', (payload: string): void => {
+                heard.push(payload);
+            }, (): void => undefined);
+            const webServer: WebServer = new WebServer(new Logger(), {
+                trustProxy: false,
+                controllersPath: path.resolve(__dirname, 'fixtures/sockets/presence'),
+                socket: {publisher, presence},
+            }, authService);
+            heard.length = 0;
+
+            await webServer.close();
+
+            expect(heard).toEqual([JSON.stringify({v: 1, i: 'a', k: 'bye'})]);
+            expect(jest.getTimerCount()).toBe(0);
+        });
     });
 
     it("stops the WebServer instead of logging the mistake like a broken HTTP controller", () => {

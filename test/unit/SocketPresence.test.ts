@@ -403,6 +403,27 @@ describe("socket presence", () => {
         expect([...b.calls, ...c.calls]).toEqual([]);
     });
 
+    it("drops a stale entry on time when one alive of its instance is lost", async () => {
+        const [a, b]: Instance[] = cluster(2);
+        b.presence.enter('room:1', 7);
+        let alives: number = 0;
+        b.broker.filter = (payload: string): boolean => {
+            if (messageKind(payload) === 'alive') {
+                alives++;
+                return alives !== 3;
+            }
+            return messageKind(payload) !== 'left';
+        };
+
+        b.presence.exit('room:1', 7);
+        advance(29999);
+        expect(await a.presence.members('room:1')).toEqual([7]);
+        advance(1);
+
+        expect(await a.presence.members('room:1')).toEqual([]);
+        expect(a.calls).toEqual([]);
+    });
+
     it("drops a stale entry of a live instance without a call", async () => {
         const [a, b, c]: Instance[] = cluster(3);
         b.presence.enter('room:1', 7);
@@ -489,7 +510,50 @@ describe("socket presence", () => {
         expect(() => a.presence.register('room', (): void => undefined)).toThrow();
         expect(() => a.presence.enter('order:1', 7)).toThrow();
         expect(() => a.presence.exit('room', 7)).toThrow();
-        expect(() => a.presence.members('user')).toThrow();
+    });
+
+    it("rejects members of a channel it cannot track", async () => {
+        const [a]: Instance[] = cluster(1);
+
+        await expect(a.presence.members('user')).rejects.toThrow('Invalid presence channel "user"');
+        await expect(a.presence.members('room')).rejects.toThrow('Invalid presence channel "room"');
+        await expect(a.presence.members('order:1')).rejects.toThrow('Channel type "order" has no presence handler');
+    });
+
+    it.each([0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])("refuses the account id %p", (userId: number) => {
+        const [a]: Instance[] = cluster(1);
+
+        expect(() => a.presence.enter('room:1', userId)).toThrow(`Invalid presence account id ${userId}`);
+        expect(() => a.presence.exit('room:1', userId)).toThrow(`Invalid presence account id ${userId}`);
+    });
+
+    it("answers members with an empty list after stop", async () => {
+        const [a, b]: Instance[] = cluster(2);
+        b.presence.enter('room:1', 7);
+        const d: Instance = instance('d');
+        const pending: Promise<number[]> = d.presence.members('room:1');
+
+        d.presence.stop();
+        a.presence.stop();
+
+        expect(await pending).toEqual([]);
+        expect(await a.presence.members('room:1')).toEqual([]);
+        expect(await d.presence.members('room:1')).toEqual([]);
+    });
+
+    it("warns once per sender about another protocol version and ignores its messages", async () => {
+        const [a]: Instance[] = cluster(1);
+        const subject: string = 'ws.presence';
+
+        shared.publish(subject, JSON.stringify({v: 2, i: 'x', k: 'joined', ch: 'room:1', u: [1]}));
+        shared.publish(subject, JSON.stringify({v: 2, i: 'x', k: 'alive'}));
+        shared.publish(subject, JSON.stringify({v: 3, i: 'y', k: 'joined', ch: 'room:1', u: [2]}));
+        shared.publish(subject, JSON.stringify({v: 2, k: 'alive'}));
+
+        expect(await a.presence.members('room:1')).toEqual([]);
+        expect(a.log.warning).toHaveBeenCalledTimes(2);
+        expect(a.log.warning).toHaveBeenNthCalledWith(1, 'Presence messages of protocol version 2 from instance "x" are ignored');
+        expect(a.log.warning).toHaveBeenNthCalledWith(2, 'Presence messages of protocol version 3 from instance "y" are ignored');
     });
 
     it("ignores malformed and own messages", async () => {
@@ -499,6 +563,8 @@ describe("socket presence", () => {
         shared.publish(subject, 'not json');
         shared.publish(subject, JSON.stringify({v: 2, i: 'x', k: 'joined', ch: 'room:1', u: [1]}));
         shared.publish(subject, JSON.stringify({v: 1, i: 'x', k: 'joined', ch: 'room:1', u: ['1']}));
+        shared.publish(subject, JSON.stringify({v: 1, i: 'x', k: 'joined', ch: 'room:1', u: [2 ** 53]}));
+        shared.publish(subject, JSON.stringify({v: 1, i: 'x', k: 'joined', ch: 'room:1', u: [0]}));
         shared.publish(subject, JSON.stringify({v: 1, i: 'x', k: 'joined', ch: 'room', u: [1]}));
         shared.publish(subject, JSON.stringify({v: 1, i: 'x', k: 'unknown'}));
         shared.publish(subject, JSON.stringify({v: 1, i: 'a', k: 'joined', ch: 'room:1', u: [2]}));
@@ -522,6 +588,22 @@ describe("socket presence", () => {
         b.presence.enter('room:1', 7);
 
         expect(await a.presence.members('room:1')).toEqual([3, 7]);
+    });
+
+    it("ends a subscription the broker reports failed while it stays open", async () => {
+        const [a, b]: Instance[] = cluster(2);
+        const failure: Error = new Error('deliver failed');
+
+        (a.broker.lastFailed as (error: Error) => void)(failure);
+        b.presence.enter('room:1', 7);
+
+        expect(a.log.error).toHaveBeenCalledWith('Presence subscription failed:', failure);
+        expect(await a.presence.members('room:1')).toEqual([]);
+        advance(SocketPresence.DEFAULTS.heartbeatMs);
+        expect(await a.presence.members('room:1')).toEqual([7]);
+        b.presence.stop();
+        a.presence.stop();
+        expect(shared.subjects()).toEqual([]);
     });
 
     it("subscribes again on the next heartbeat after the broker ends the subscription", async () => {
